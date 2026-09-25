@@ -12,6 +12,12 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
+
+class ApiKeyBlockedError(RuntimeError):
+    """Ключ 2ГИС окончательно заблокирован (а не временный троттлинг) —
+    повторные попытки с тем же ключом бессмысленны, нужен другой ключ или
+    обход через прямые запросы к сайту (см. web_fallback.py)."""
+
 # Пул актуальных браузерных User-Agent для десктопов
 USER_AGENTS = [
     # Chrome on Windows
@@ -212,18 +218,42 @@ class AntiBanHttpClient:
 
                     status = response.status
 
-                    # Успешный ответ
+                    # Успешный ответ (HTTP-уровень). ВАЖНО: Catalog API 2ГИС
+                    # возвращает блокировку ключа с HTTP-статусом 200 и кодом
+                    # ошибки только внутри JSON (meta.code=403), в отличие от
+                    # Reviews API, который отдаёт настоящий HTTP 403 — поэтому
+                    # проверяем тело в обоих случаях.
                     if status == 200:
+                        body = await response.json()
+                        error = ((body or {}).get("meta") or {}).get("error") or {}
+                        if error.get("type") == "apiKeyIsBlocked" or "key is blocked" in (error.get("message") or "").lower():
+                            raise ApiKeyBlockedError(
+                                f"Ключ 2ГИС заблокирован: {error.get('message') or error}"
+                            )
                         self.proxy_manager.report_success(current_proxy)
                         # Постепенное восстановление базовой задержки при успехе
                         self._current_backoff = max(
                             self.base_delay,
                             self._current_backoff * 0.9,
                         )
-                        return await response.json()
+                        return body
 
                     # Обработка анти-фрод кодов 429 (Too Many Requests) и 403 (Forbidden)
                     if status in (429, 403):
+                        # 403 бывает двух видов: временный троттлинг (retry имеет смысл)
+                        # и окончательная блокировка ключа (retry бессмысленен — нужен
+                        # другой ключ / обход через сайт напрямую).
+                        if status == 403:
+                            try:
+                                body = await response.json()
+                            except Exception:
+                                body = {}
+                            error = ((body or {}).get("meta") or {}).get("error") or {}
+                            if error.get("type") == "apiKeyIsBlocked" or "key is blocked" in (error.get("message") or "").lower():
+                                raise ApiKeyBlockedError(
+                                    f"Ключ 2ГИС заблокирован: {error.get('message') or error}"
+                                )
+
                         self.proxy_manager.report_failure(current_proxy)
                         # Экспоненциальное увеличение задержки бэкоффа
                         async with self._lock:

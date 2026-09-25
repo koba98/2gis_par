@@ -315,6 +315,25 @@ class Storage:
                     rows,
                 )
 
+    async def crawl_task_search_terms(self, region_id: int) -> List[str]:
+        """
+        Поисковые термины, использованные при обходе региона (текст запроса
+        или название рубрики) — нужны браузерному фолбэку: сайт 2ГИС ищет по
+        тексту в UI, а не по rubric_id/bbox, как Catalog API.
+        """
+        async with self._lock:
+            cur = await self._conn.execute(
+                """
+                SELECT DISTINCT coalesce(t.query, r.name) AS term
+                FROM crawl_tasks t
+                LEFT JOIN rubrics r ON r.id = t.rubric_id
+                WHERE t.region_id = %s AND coalesce(t.query, r.name) IS NOT NULL
+                """,
+                (region_id,),
+            )
+            rows = await cur.fetchall()
+            return [row["term"] for row in rows if row["term"]]
+
     async def clear_tasks(self, region_id: int) -> int:
         """Удаляет очередь обхода региона (для повторного полного обхода)."""
         async with self._lock:

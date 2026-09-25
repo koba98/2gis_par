@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
-from client import AntiBanHttpClient
+from client import AntiBanHttpClient, ApiKeyBlockedError
 from parser import DEFAULT_CATALOG_KEY, DEFAULT_REVIEWS_KEY, TwoGisCrawler
 from storage import Storage
 
@@ -73,9 +73,110 @@ async def log_stats(storage: Storage) -> None:
     logging.info("=" * 60)
 
 
+# Категории для браузерного фолбэка каталога, когда рубрикатор недоступен
+# (сам API заблокирован) и пользователь не передал -q явно. Покрытие хуже,
+# чем через рубрикатор, но позволяет собирать каталог вообще без ключа.
+DEFAULT_BROWSER_QUERIES = [
+    "кафе", "ресторан", "фастфуд", "магазин продукты", "супермаркет",
+    "аптека", "салон красоты", "парикмахерская", "автосервис", "автозапчасти",
+    "стоматология", "клиника", "больница", "банк", "отель", "фитнес клуб",
+    "школа", "детский сад", "юридические услуги", "недвижимость", "одежда",
+    "строительный магазин", "автосалон", "ветеринарная клиника", "нотариус",
+]
+
+class FallbackHolder:
+    """Лениво создаёт и переиспользует один BrowserFallback на весь прогон
+    (запуск реального Chrome — дорогая операция, не на каждый регион)."""
+
+    def __init__(self, headless: bool):
+        self.headless = headless
+        self._fallback = None
+
+    async def get(self):
+        if self._fallback is None:
+            from web_fallback import BrowserFallback  # опциональная зависимость (playwright)
+            self._fallback = await BrowserFallback(headless=self.headless).start()
+        return self._fallback
+
+    async def close(self) -> None:
+        if self._fallback is not None:
+            await self._fallback.close()
+            self._fallback = None
+
+
+async def crawl_region(
+    crawler: TwoGisCrawler,
+    storage: Storage,
+    region: dict,
+    args: argparse.Namespace,
+    fallback_holder: "FallbackHolder",
+) -> None:
+    """Обходит один регион: каталог + (опционально) отзывы, с автоматическим
+    переключением на браузерный фолбэк при ApiKeyBlockedError."""
+    bbox = args.bbox or (region["min_lon"], region["min_lat"], region["max_lon"], region["max_lat"])
+    if None in bbox:
+        logging.warning("Пропуск региона %s: отсутствуют координаты bbox.", region["name"])
+        return
+    if args.fresh:
+        logging.info("Удалено задач прошлого обхода: %d", await storage.clear_tasks(region["id"]))
+
+    try:
+        await crawler.seed_tasks(region, bbox, queries=args.query, rubric_filter=args.rubric)
+        await crawler.crawl_catalog(region["id"], workers=args.workers)
+    except ApiKeyBlockedError as exc:
+        if not args.browser_fallback:
+            raise SystemExit(
+                f"Ключ каталога заблокирован ({exc}). Запустите с --browser-fallback, "
+                "чтобы дособрать данные напрямую через браузер."
+            )
+        logging.warning("Ключ каталога заблокирован (%s). Переключаемся на браузерный фолбэк.", exc)
+        slug = crawler.region_slug(region["name"])
+        if not slug:
+            logging.error(
+                "Нет slug для региона '%s' в REGION_SLUGS (parser.py) — "
+                "браузерный фолбэк для каталога невозможен, пропускаю.", region["name"]
+            )
+        else:
+            terms = (
+                args.query
+                or await storage.crawl_task_search_terms(region["id"])
+                or DEFAULT_BROWSER_QUERIES
+            )
+            fb = await fallback_holder.get()
+            await crawler.crawl_catalog_via_browser(
+                fb, region["id"], slug, terms, max_pages=args.browser_max_pages
+            )
+
+    if args.no_reviews:
+        return
+    try:
+        await crawler.crawl_reviews(region["id"], workers=args.workers,
+                                    only_missing=getattr(args, "only_missing", False))
+    except ApiKeyBlockedError as exc:
+        if not args.browser_fallback:
+            raise SystemExit(
+                f"Ключ отзывов заблокирован ({exc}). Запустите с --browser-fallback, "
+                "чтобы дособрать отзывы напрямую через браузер."
+            )
+        logging.warning("Ключ отзывов заблокирован (%s). Переключаемся на браузерный фолбэк.", exc)
+        slug = crawler.region_slug(region["name"])
+        if not slug:
+            logging.error(
+                "Нет slug для региона '%s' в REGION_SLUGS (parser.py) — "
+                "браузерный фолбэк для отзывов невозможен, пропускаю.", region["name"]
+            )
+        else:
+            fb = await fallback_holder.get()
+            await crawler.crawl_reviews_via_browser(
+                fb, region["id"], slug, only_missing=getattr(args, "only_missing", False)
+            )
+
+
 async def run(args: argparse.Namespace) -> None:
     if not args.dsn:
         raise SystemExit("Не задана строка подключения: --dsn или переменная PG_DSN.")
+
+    fallback_holder = FallbackHolder(headless=not args.browser_show)
 
     async with Storage(args.dsn, args.schema) as storage:
         if args.command == "init-db":
@@ -93,38 +194,62 @@ async def run(args: argparse.Namespace) -> None:
             max_delay=args.max_delay,
             request_timeout=args.timeout,
         )
-        async with client:
-            crawler = TwoGisCrawler(
-                client=client,
-                storage=storage,
-                catalog_key=args.catalog_key,
-                reviews_key=args.reviews_key,
-                page_size=getattr(args, "page_size", 10),
-                max_pages=getattr(args, "max_pages", 5),
-                min_tile_deg=getattr(args, "min_tile", 0.002),
-            )
+        try:
+            async with client:
+                crawler = TwoGisCrawler(
+                    client=client,
+                    storage=storage,
+                    catalog_key=args.catalog_key,
+                    reviews_key=args.reviews_key,
+                    page_size=getattr(args, "page_size", 10),
+                    max_pages=getattr(args, "max_pages", 5),
+                    min_tile_deg=getattr(args, "min_tile", 0.002),
+                )
 
-            if args.command == "crawl":
-                await storage.init_db()
-                region = await crawler.resolve_region(name=args.region, region_id=args.region_id)
-                bbox = args.bbox or (region["min_lon"], region["min_lat"],
-                                     region["max_lon"], region["max_lat"])
-                if None in bbox:
-                    raise SystemExit("У региона нет границ — задайте область через --bbox.")
-                if args.fresh:
-                    logging.info("Удалено задач прошлого обхода: %d",
-                                 await storage.clear_tasks(region["id"]))
-                await crawler.seed_tasks(region, bbox, queries=args.query,
-                                         rubric_filter=args.rubric)
-                await crawler.crawl_catalog(region["id"], workers=args.workers)
-                if not args.no_reviews:
-                    await crawler.crawl_reviews(region["id"], workers=args.workers)
+                if args.command == "crawl":
+                    await storage.init_db()
+                    if args.country:
+                        regions = await crawler.list_country_regions(country_code=args.country)
+                        logging.info("Найдено %d регионов для страны '%s'", len(regions), args.country)
+                        for reg in regions:
+                            logging.info("=" * 60)
+                            logging.info(">>> ОБХОД РЕГИОНА: %s (ID %s)", reg["name"], reg["id"])
+                            logging.info("=" * 60)
+                            await crawl_region(crawler, storage, reg, args, fallback_holder)
+                    else:
+                        region = await crawler.resolve_region(name=args.region, region_id=args.region_id)
+                        await crawl_region(crawler, storage, region, args, fallback_holder)
 
-            elif args.command == "reviews":
-                await crawler.crawl_reviews(args.region_id, workers=args.workers,
-                                            only_missing=args.only_missing)
-
-        await log_stats(storage)
+                elif args.command == "reviews":
+                    if args.country:
+                        regions = await crawler.list_country_regions(country_code=args.country)
+                        for reg in regions:
+                            logging.info(">>> СБОР ОТЗЫВОВ РЕГИОНА: %s (ID %s)", reg["name"], reg["id"])
+                            try:
+                                await crawler.crawl_reviews(reg["id"], workers=args.workers,
+                                                            only_missing=args.only_missing)
+                            except ApiKeyBlockedError as exc:
+                                if not args.browser_fallback:
+                                    raise SystemExit(
+                                        f"Ключ отзывов заблокирован ({exc}). "
+                                        "Запустите с --browser-fallback."
+                                    )
+                                slug = crawler.region_slug(reg["name"])
+                                if slug:
+                                    fb = await fallback_holder.get()
+                                    await crawler.crawl_reviews_via_browser(
+                                        fb, reg["id"], slug, only_missing=args.only_missing
+                                    )
+                    elif args.region:
+                        region = await crawler.resolve_region(name=args.region)
+                        await crawler.crawl_reviews(region["id"], workers=args.workers,
+                                                    only_missing=args.only_missing)
+                    else:
+                        await crawler.crawl_reviews(args.region_id, workers=args.workers,
+                                                    only_missing=args.only_missing)
+            await log_stats(storage)
+        finally:
+            await fallback_holder.close()
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -149,6 +274,15 @@ def parse_arguments() -> argparse.Namespace:
     common.add_argument("--workers", type=int, default=2,
                         help="Число параллельных воркеров (частоту ограничивает --delay). По умолчанию: 2")
     common.add_argument("-v", "--verbose", action="store_true", help="DEBUG-логирование")
+    common.add_argument("--browser-fallback", action="store_true",
+                        help="При блокировке API-ключа переключаться на прямой сбор "
+                             "через реальный браузер (Playwright + системный Chrome), "
+                             "как в dgis_stations_parser.py. Требует: pip install playwright")
+    common.add_argument("--browser-show", action="store_true",
+                        help="Показывать окно браузера (по умолчанию headless)")
+    common.add_argument("--browser-max-pages", type=int, default=50,
+                        help="Максимум страниц поиска на сайте на один запрос при "
+                             "браузерном фолбэке. По умолчанию: 50")
 
     parser = argparse.ArgumentParser(
         description="Полный парсер каталога и отзывов 2ГИС с сохранением в PostgreSQL."
@@ -163,6 +297,7 @@ def parse_arguments() -> argparse.Namespace:
     target = crawl.add_mutually_exclusive_group(required=True)
     target.add_argument("-r", "--region", help="Название региона/города, например 'Алматы'")
     target.add_argument("--region-id", type=int, help="ID региона 2ГИС")
+    target.add_argument("--country", help="Код страны для обхода всех регионов (например 'kz' для Казахстана)")
     crawl.add_argument("--bbox", type=parse_bbox, default=None,
                        help="Ограничить область: min_lon,min_lat,max_lon,max_lat")
     crawl.add_argument("-q", "--query", action="append",
@@ -182,6 +317,8 @@ def parse_arguments() -> argparse.Namespace:
     reviews = sub.add_parser("reviews", parents=[common],
                              help="Собрать отзывы по сохранённым филиалам")
     reviews.add_argument("--region-id", type=int, default=None, help="Только филиалы региона")
+    reviews.add_argument("-r", "--region", help="Название региона/города")
+    reviews.add_argument("--country", help="Код страны для сбора отзывов по всем регионам (например 'kz')")
     reviews.add_argument("--only-missing", action="store_true",
                          help="Только филиалы, по которым отзывы ещё не собирались")
 

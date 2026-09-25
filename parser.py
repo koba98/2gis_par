@@ -17,8 +17,12 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from client import AntiBanHttpClient
+from client import AntiBanHttpClient, ApiKeyBlockedError
 from storage import Storage
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from web_fallback import BrowserFallback
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +35,35 @@ ITEMS_URL = f"{CATALOG_API}/3.0/items"
 REGION_SEARCH_URL = f"{CATALOG_API}/2.0/region/search"
 REGION_GET_URL = f"{CATALOG_API}/2.0/region/get"
 RUBRIC_LIST_URL = f"{CATALOG_API}/2.0/catalog/rubric/list"
+REGION_LIST_URL = f"{CATALOG_API}/2.0/region/list"
 REVIEWS_API_URL = "https://public-api.reviews.2gis.com/2.0/branches"
+
+# Slug города для URL вида https://2gis.kz/<slug>/... (браузерный фолбэк).
+# Ключ — название региона/города, как его отдаёт Catalog API region/search
+# и region/list (см. TwoGisCrawler.resolve_region / list_country_regions).
+# Список проверен пользователем в dgis_stations_parser.py (REGIONS).
+REGION_SLUGS: Dict[str, str] = {
+    "Астана": "astana",
+    "Алматы": "almaty",
+    "Шымкент": "shymkent",
+    "Актау": "aktau",
+    "Актобе": "aktobe",
+    "Атырау": "atyrau",
+    "Жезказган": "zhezkazgan",
+    "Караганда": "karaganda",
+    "Кокшетау": "kokshetau",
+    "Костанай": "kostanay",
+    "Кызылорда": "kyzylorda",
+    "Павлодар": "pavlodar",
+    "Петропавловск": "petropavlovsk",
+    "Семей": "semey",
+    "Тараз": "taraz",
+    "Туркестан": "turkestan",
+    "Уральск": "uralsk",
+    "Усть-Каменогорск": "ust-kamenogorsk",
+    "Экибастуз": "ekibastuz",
+    "Талдыкорган": "taldykorgan",
+}
 
 # Все поля карточки филиала, которые отдаёт Catalog API 3.0
 ITEM_FIELDS = ",".join(
@@ -302,6 +334,26 @@ class TwoGisCrawler:
                     (region["min_lon"], region["min_lat"], region["max_lon"], region["max_lat"]))
         return region
 
+    async def list_country_regions(self, country_code: str = "kz") -> List[Dict[str, Any]]:
+        """Возвращает и сохраняет список всех регионов страны (например, 'kz')."""
+        params = {
+            "country_code_filter": country_code,
+            "page_size": 50,
+            "fields": "items.bounds",
+            "key": self.catalog_key,
+        }
+        data = await self.client.request_json(REGION_LIST_URL, params=params)
+        if not _check_meta(data):
+            return []
+        items = (data.get("result") or {}).get("items") or []
+        regions = []
+        for item in items:
+            reg = parse_region(item)
+            await self.storage.save_region(reg)
+            regions.append(reg)
+        logger.info("Найдено регионов для страны '%s': %d", country_code, len(regions))
+        return regions
+
     async def load_rubrics(self, region_id: int) -> List[Dict[str, Any]]:
         """Рекурсивно загружает рубрикатор региона. Возвращает все рубрики (группы и конечные)."""
         collected: Dict[int, Dict[str, Any]] = {}
@@ -446,6 +498,11 @@ class TwoGisCrawler:
                     await self.process_task(task)
                 except asyncio.CancelledError:
                     raise
+                except ApiKeyBlockedError:
+                    # Ключ заблокирован окончательно — ретраить бессмысленно,
+                    # останавливаем весь обход, чтобы вызывающий код мог
+                    # переключиться на браузерный фолбэк (см. main.py).
+                    raise
                 except Exception as exc:
                     status = "error" if task["attempts"] >= self.max_task_attempts else "pending"
                     await self.storage.finish_task(task["id"], status, task["total"],
@@ -480,8 +537,29 @@ class TwoGisCrawler:
             "locale": "ru_RU",
         }
         saved = 0
+        tried_fallback = False
         while url:
-            data = await self.client.request_json(url, params=params)
+            try:
+                data = await self.client.request_json(url, params=params)
+            except ApiKeyBlockedError as exc:
+                if not tried_fallback and self.reviews_key != DEFAULT_REVIEWS_KEY:
+                    logger.warning(
+                        "Ключ отзывов %s заблокирован (%s). Переключаемся на резервный ключ %s",
+                        self.reviews_key, exc, DEFAULT_REVIEWS_KEY
+                    )
+                    self.reviews_key = DEFAULT_REVIEWS_KEY
+                    tried_fallback = True
+                    if params:
+                        params["key"] = DEFAULT_REVIEWS_KEY
+                    if url:
+                        url = self._with_reviews_key(url)
+                    continue
+                # Оба ключа заблокированы — пробрасываем наружу, чтобы
+                # crawl_reviews() мог переключиться на браузерный фолбэк.
+                raise
+            except Exception as exc:
+                logger.error("Ошибка при получении отзывов филиала %s: %s", branch_id, exc)
+                break
             params = None
             raw_reviews = data.get("reviews") or []
             if not raw_reviews:
@@ -494,7 +572,6 @@ class TwoGisCrawler:
                 break
             next_link = (data.get("meta") or {}).get("next_link")
             url = self._with_reviews_key(next_link) if next_link else None
-
         await self.storage.mark_reviews_synced(branch_id)
         return saved
 
@@ -519,6 +596,8 @@ class TwoGisCrawler:
                     total_saved += saved
                 except asyncio.CancelledError:
                     raise
+                except ApiKeyBlockedError:
+                    raise
                 except Exception as exc:
                     logger.error("Отзывы филиала %s: %s", branch["id"], exc)
                     continue
@@ -530,4 +609,78 @@ class TwoGisCrawler:
         await asyncio.gather(*(worker() for _ in range(workers)))
         logger.info("Сбор отзывов завершён: филиалов %d, отзывов сохранено/обновлено %d",
                     processed, total_saved)
+        return total_saved
+
+    # ------------------------------------------------------------------ браузерный фолбэк
+
+    @staticmethod
+    def region_slug(region_name: str) -> Optional[str]:
+        """Slug города 2ГИС для URL https://2gis.kz/<slug>/... по имени региона."""
+        return REGION_SLUGS.get(region_name)
+
+    async def crawl_catalog_via_browser(
+        self,
+        fallback: "BrowserFallback",
+        region_id: int,
+        city_slug: str,
+        queries: List[str],
+        max_pages: int = 50,
+    ) -> int:
+        """
+        Обход каталога через реальный браузер (когда API-ключ заблокирован):
+        постранично открывает поиск на сайте 2ГИС и сохраняет перехваченные
+        карточки организаций. Полноту не гарантирует (сайт отдаёт то же
+        ограничение глубины пагинации, что и в обычном UI), но не требует
+        рабочего API-ключа вообще.
+        """
+        total_saved = 0
+        for query in queries:
+            logger.info("Браузерный обход: запрос '%s' в %s", query, city_slug)
+            empty_streak = 0
+            for page_num in range(1, max_pages + 1):
+                try:
+                    items = await fallback.search_organizations(query, city_slug, page_num)
+                except Exception as exc:
+                    logger.error("Браузерный фолбэк: ошибка страницы %d ('%s'): %s",
+                                 page_num, query, exc)
+                    break
+                if not items:
+                    empty_streak += 1
+                    if empty_streak >= 2:
+                        break
+                    continue
+                empty_streak = 0
+                saved = await self._save_items(items, region_id)
+                total_saved += saved
+                logger.info("Браузерный обход: '%s' стр. %d — сохранено %d карточек",
+                            query, page_num, saved)
+        logger.info("Браузерный обход каталога завершён. Всего сохранено: %d", total_saved)
+        return total_saved
+
+    async def crawl_reviews_via_browser(
+        self,
+        fallback: "BrowserFallback",
+        region_id: Optional[int],
+        city_slug: str,
+        only_missing: bool = False,
+    ) -> int:
+        """Собирает отзывы через браузер для всех сохранённых филиалов региона."""
+        branches = await self.storage.branches_for_reviews(region_id, only_missing)
+        logger.info("Браузерный сбор отзывов: филиалов в очереди %d", len(branches))
+        total_saved = 0
+        for i, branch in enumerate(branches, 1):
+            try:
+                raw_reviews = await fallback.fetch_reviews(branch["id"], city_slug)
+            except Exception as exc:
+                logger.error("Браузерный фолбэк: отзывы филиала %s: %s", branch["id"], exc)
+                continue
+            if not raw_reviews:
+                continue
+            reviews = [parse_review(r, branch["id"]) for r in raw_reviews if r.get("id")]
+            saved = await self.storage.save_reviews(reviews)
+            await self.storage.mark_reviews_synced(branch["id"])
+            total_saved += saved
+            logger.info("[%d/%d] %s: сохранено отзывов %d (браузер)",
+                        i, len(branches), branch["name"], saved)
+        logger.info("Браузерный сбор отзывов завершён: сохранено %d", total_saved)
         return total_saved
