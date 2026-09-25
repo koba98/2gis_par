@@ -111,6 +111,9 @@ class AntiBanHttpClient:
         self._current_backoff = base_delay
         self._session: Optional[aiohttp.ClientSession] = None
         self._lock = asyncio.Lock()
+        # Глобальный троттлинг: общий интервал между запросами для всех воркеров
+        self._throttle_lock = asyncio.Lock()
+        self._next_request_at = 0.0
 
     async def get_session(self) -> aiohttp.ClientSession:
         """Получает или создает активную клиентскую aiohttp-сессию."""
@@ -157,12 +160,19 @@ class AntiBanHttpClient:
         return headers
 
     async def _throttle(self) -> None:
-        """Выполняет адаптивную паузу с добавлением случайного шума (jitter)."""
-        # Рандомизация паузы: +/- 25% от текущего значения
-        jitter = random.uniform(0.75, 1.25)
-        sleep_time = self._current_backoff * jitter
-        logger.debug("Троттлинг: пауза %.2f сек...", sleep_time)
-        await asyncio.sleep(sleep_time)
+        """
+        Выдерживает адаптивную паузу со случайным шумом (jitter) между запросами.
+        Интервал общий для всех конкурентных воркеров, использующих клиент.
+        """
+        loop = asyncio.get_running_loop()
+        async with self._throttle_lock:
+            wait = self._next_request_at - loop.time()
+            if wait > 0:
+                logger.debug("Троттлинг: пауза %.2f сек...", wait)
+                await asyncio.sleep(wait)
+            # Рандомизация паузы: +/- 25% от текущего значения
+            jitter = random.uniform(0.75, 1.25)
+            self._next_request_at = loop.time() + self._current_backoff * jitter
 
     async def request_json(
         self,

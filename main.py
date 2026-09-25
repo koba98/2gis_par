@@ -1,29 +1,45 @@
 """
-Главная точка входа для автономного парсера 2ГИС.
-Предоставляет гибкий CLI-интерфейс, управление параметрами поиска,
-настройку прокси, троттлинга и безопасное завершение работы (graceful shutdown).
+Главная точка входа парсера 2ГИС.
+
+Подкоманды:
+    init-db   создать схему и таблицы в PostgreSQL
+    crawl     полный обход региона (все рубрики или заданные запросы) + отзывы
+    reviews   (до)собрать отзывы по уже сохранённым филиалам
+    stats     показать количество записей в БД
+
+Настройки подключения и ключи можно задать в .env (см. .env.example).
 """
 
 import argparse
 import asyncio
 import logging
 import os
-import signal
 import sys
+from pathlib import Path
 from typing import List, Optional
 
 from client import AntiBanHttpClient
-from database import Database
-from parser import TwoGisParser, DEFAULT_CATALOG_KEY, DEFAULT_REVIEWS_KEY
+from parser import DEFAULT_CATALOG_KEY, DEFAULT_REVIEWS_KEY, TwoGisCrawler
+from storage import Storage
+
+
+def load_dotenv(path: Path = Path(__file__).resolve().parent / ".env") -> None:
+    """Подгружает переменные из .env (без перезаписи уже заданных в окружении)."""
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip("'\""))
 
 
 def setup_logging(verbose: bool = False) -> None:
     """Настраивает форматированный вывод логов в консоль."""
-    level = logging.DEBUG if verbose else logging.INFO
-    log_format = "%(asctime)s [%(levelname)s] [%(name)s] %(message)s"
     logging.basicConfig(
-        level=level,
-        format=log_format,
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
@@ -33,206 +49,156 @@ def load_proxies_from_file(file_path: Optional[str]) -> List[str]:
     """Загружает список прокси из текстового файла (по одному на строку)."""
     if not file_path:
         return []
-
     if not os.path.exists(file_path):
         logging.warning("Файл прокси '%s' не найден.", file_path)
         return []
-
     with open(file_path, "r", encoding="utf-8") as f:
         proxies = [line.strip() for line in f if line.strip() and not line.startswith("#")]
-
     logging.info("Загружено %d прокси-серверов из файла %s", len(proxies), file_path)
     return proxies
 
 
-async def run_parser(args: argparse.Namespace) -> None:
-    """Асинхронная корутина запуска и координации компонентов парсера."""
-    proxies = load_proxies_from_file(args.proxies)
+def parse_bbox(value: str):
+    parts = [float(p) for p in value.split(",")]
+    if len(parts) != 4:
+        raise argparse.ArgumentTypeError("bbox задаётся как min_lon,min_lat,max_lon,max_lat")
+    return tuple(parts)
 
-    db = Database(db_path=args.db)
-    client = AntiBanHttpClient(
-        proxies=proxies,
-        base_delay=args.delay,
-        max_delay=args.max_delay,
-        request_timeout=args.timeout,
-    )
 
-    parser = TwoGisParser(
-        client=client,
-        db=db,
-        catalog_key=args.catalog_key or DEFAULT_CATALOG_KEY,
-        reviews_key=args.reviews_key or DEFAULT_REVIEWS_KEY,
-    )
+async def log_stats(storage: Storage) -> None:
+    stats = await storage.get_stats()
+    logging.info("=" * 60)
+    logging.info("В БД (схема %s): %s", storage.schema,
+                 ", ".join(f"{k}={v}" for k, v in stats.items()))
+    logging.info("=" * 60)
 
-    # Регистрация обработчиков завершения для безопасного выхода
-    loop = asyncio.get_running_loop()
-    stop_event = asyncio.Event()
 
-    def handle_signal():
-        logging.warning("Получен сигнал прерывания. Завершаем текущие задачи...")
-        stop_event.set()
+async def run(args: argparse.Namespace) -> None:
+    if not args.dsn:
+        raise SystemExit("Не задана строка подключения: --dsn или переменная PG_DSN.")
 
-    # Для Windows SIGINT перехватывается стандартным try/except, на Unix можно через add_signal_handler
-    if sys.platform != "win32":
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, handle_signal)
+    async with Storage(args.dsn, args.schema) as storage:
+        if args.command == "init-db":
+            await storage.init_db()
+            await log_stats(storage)
+            return
+        if args.command == "stats":
+            await log_stats(storage)
+            logging.info("Очередь обхода: %s", await storage.task_stats())
+            return
 
-    try:
-        async with db:
-            async with client:
-                logging.info("=" * 60)
-                logging.info("2GIS Autonomous Catalog & Reviews Parser")
-                logging.info("=" * 60)
-                logging.info("Поисковый запрос: '%s'", args.query)
-                logging.info("Локация (lon,lat): %s", args.location or "Не указана")
-                logging.info("Целевой лимит организаций: %d", args.limit)
-                logging.info("Сбор отзывов: %s", "Отключен" if args.no_reviews else f"Включен (до {args.max_reviews} на объект)")
-                logging.info("Файл БД: %s", args.db)
-                logging.info("Активных прокси: %d", client.proxy_manager.total_count)
-                logging.info("=" * 60)
+        client = AntiBanHttpClient(
+            proxies=load_proxies_from_file(args.proxies),
+            base_delay=args.delay,
+            max_delay=args.max_delay,
+            request_timeout=args.timeout,
+        )
+        async with client:
+            crawler = TwoGisCrawler(
+                client=client,
+                storage=storage,
+                catalog_key=args.catalog_key,
+                reviews_key=args.reviews_key,
+                page_size=getattr(args, "page_size", 10),
+                max_pages=getattr(args, "max_pages", 5),
+                min_tile_deg=getattr(args, "min_tile", 0.002),
+            )
 
-                parse_task = asyncio.create_task(
-                    parser.search_and_parse(
-                        query=args.query,
-                        location=args.location,
-                        city_id=args.city_id,
-                        max_places=args.limit,
-                        page_size=args.page_size,
-                        fetch_comments=not args.no_reviews,
-                        max_reviews_per_place=args.max_reviews,
-                    )
-                )
+            if args.command == "crawl":
+                await storage.init_db()
+                region = await crawler.resolve_region(name=args.region, region_id=args.region_id)
+                bbox = args.bbox or (region["min_lon"], region["min_lat"],
+                                     region["max_lon"], region["max_lat"])
+                if None in bbox:
+                    raise SystemExit("У региона нет границ — задайте область через --bbox.")
+                if args.fresh:
+                    logging.info("Удалено задач прошлого обхода: %d",
+                                 await storage.clear_tasks(region["id"]))
+                await crawler.seed_tasks(region, bbox, queries=args.query,
+                                         rubric_filter=args.rubric)
+                await crawler.crawl_catalog(region["id"], workers=args.workers)
+                if not args.no_reviews:
+                    await crawler.crawl_reviews(region["id"], workers=args.workers)
 
-                # Ожидаем либо завершения парсинга, либо сигнала остановки
-                done, pending = await asyncio.wait(
-                    [parse_task, asyncio.create_task(stop_event.wait())],
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
+            elif args.command == "reviews":
+                await crawler.crawl_reviews(args.region_id, workers=args.workers,
+                                            only_missing=args.only_missing)
 
-                if stop_event.is_set():
-                    parse_task.cancel()
-                    logging.info("Операция парсинга была прервана пользователем.")
-
-                stats = await db.get_stats()
-                logging.info("=" * 60)
-                logging.info("ИТОГИ СБОРА:")
-                logging.info("Организаций в БД: %d", stats["places"])
-                logging.info("Отзывов в БД:      %d", stats["comments"])
-                logging.info("База данных сохранена: %s", os.path.abspath(args.db))
-                logging.info("=" * 60)
-
-    except asyncio.CancelledError:
-        logging.info("Задачи были отменены.")
-    except Exception as exc:
-        logging.exception("Непредвиденная ошибка в процессе работы парсера: %s", exc)
+        await log_stats(storage)
 
 
 def parse_arguments() -> argparse.Namespace:
-    """Определяет аргументы командной строки."""
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--dsn", default=os.getenv("PG_DSN"),
+                        help="Строка подключения PostgreSQL (env PG_DSN), "
+                             "например postgresql://user:pass@localhost:5432/db")
+    common.add_argument("--schema", default=os.getenv("PG_SCHEMA", "twogis"),
+                        help="Схема для таблиц (env PG_SCHEMA). По умолчанию: twogis")
+    common.add_argument("--catalog-key", default=os.getenv("TWOGIS_CATALOG_KEY", DEFAULT_CATALOG_KEY),
+                        help="Ключ Catalog API 2ГИС (env TWOGIS_CATALOG_KEY)")
+    common.add_argument("--reviews-key", default=os.getenv("TWOGIS_REVIEWS_KEY", DEFAULT_REVIEWS_KEY),
+                        help="Ключ Reviews API 2ГИС (env TWOGIS_REVIEWS_KEY)")
+    common.add_argument("--proxies", default=None,
+                        help="Файл со списком прокси (http://ip:port или http://user:pass@ip:port)")
+    common.add_argument("--delay", type=float, default=1.0,
+                        help="Базовая пауза между запросами, сек. По умолчанию: 1.0")
+    common.add_argument("--max-delay", type=float, default=30.0,
+                        help="Максимальный бэкофф при 429/403, сек. По умолчанию: 30.0")
+    common.add_argument("--timeout", type=float, default=15.0,
+                        help="Таймаут HTTP-запроса, сек. По умолчанию: 15.0")
+    common.add_argument("--workers", type=int, default=2,
+                        help="Число параллельных воркеров (частоту ограничивает --delay). По умолчанию: 2")
+    common.add_argument("-v", "--verbose", action="store_true", help="DEBUG-логирование")
+
     parser = argparse.ArgumentParser(
-        description="Автономный асинхронный парсер каталога и отзывов 2ГИС с обходом блокировок."
+        description="Полный парсер каталога и отзывов 2ГИС с сохранением в PostgreSQL."
     )
-    parser.add_argument(
-        "-q", "--query",
-        type=str,
-        default="кафе",
-        help="Поисковый запрос (например: 'ресторан', 'аптека', 'автосервис', 'отель'). По умолчанию: 'кафе'",
-    )
-    parser.add_argument(
-        "-l", "--location",
-        type=str,
-        default="37.6176,55.7558",
-        help="Координаты центра поиска в формате 'lon,lat' (долгота, широта). По умолчанию: Москва '37.6176,55.7558'",
-    )
-    parser.add_argument(
-        "--city-id",
-        type=str,
-        default=None,
-        help="ID города в 2ГИС (например '4504222397630173' для Москвы).",
-    )
-    parser.add_argument(
-        "-n", "--limit",
-        type=int,
-        default=10,
-        help="Максимальное количество организаций для сбора. По умолчанию: 10",
-    )
-    parser.add_argument(
-        "--page-size",
-        type=int,
-        default=10,
-        help="Размер страницы выдачи (1-50). По умолчанию: 10",
-    )
-    parser.add_argument(
-        "--max-reviews",
-        type=int,
-        default=20,
-        help="Максимальное число отзывов на одну организацию при пагинации. По умолчанию: 20",
-    )
-    parser.add_argument(
-        "--no-reviews",
-        action="store_true",
-        help="Отключить сбор отзывов (собирать только организации).",
-    )
-    parser.add_argument(
-        "--proxies",
-        type=str,
-        default=None,
-        help="Путь к текстовому файлу со списком прокси (http://ip:port или http://user:pass@ip:port).",
-    )
-    parser.add_argument(
-        "--db",
-        type=str,
-        default="2gis_data.db",
-        help="Имя файла базы данных SQLite. По умолчанию: 2gis_data.db",
-    )
-    parser.add_argument(
-        "--delay",
-        type=float,
-        default=1.0,
-        help="Базовая задержка троттлинга между запросами в секундах. По умолчанию: 1.0",
-    )
-    parser.add_argument(
-        "--max-delay",
-        type=float,
-        default=30.0,
-        help="Максимальная задержка бэкоффа при ошибках 429/403 в секундах. По умолчанию: 30.0",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=float,
-        default=15.0,
-        help="Таймаут одного HTTP-запроса в секундах. По умолчанию: 15.0",
-    )
-    parser.add_argument(
-        "--catalog-key",
-        type=str,
-        default=None,
-        help="Пользовательский API-ключ для каталога (Places API).",
-    )
-    parser.add_argument(
-        "--reviews-key",
-        type=str,
-        default=None,
-        help="Пользовательский API-ключ для отзывов (Reviews API).",
-    )
-    parser.add_argument(
-        "-v", "--verbose",
-        action="store_true",
-        help="Включить подробный отладочный вывод (DEBUG).",
-    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("init-db", parents=[common], help="Создать схему и таблицы")
+    sub.add_parser("stats", parents=[common], help="Статистика по БД")
+
+    crawl = sub.add_parser("crawl", parents=[common],
+                           help="Полный обход региона: все организации и отзывы")
+    target = crawl.add_mutually_exclusive_group(required=True)
+    target.add_argument("-r", "--region", help="Название региона/города, например 'Алматы'")
+    target.add_argument("--region-id", type=int, help="ID региона 2ГИС")
+    crawl.add_argument("--bbox", type=parse_bbox, default=None,
+                       help="Ограничить область: min_lon,min_lat,max_lon,max_lat")
+    crawl.add_argument("-q", "--query", action="append",
+                       help="Поисковый запрос вместо обхода рубрикатора (можно несколько раз)")
+    crawl.add_argument("--rubric", action="append",
+                       help="Обходить только рубрики, содержащие подстроку (можно несколько раз)")
+    crawl.add_argument("--page-size", type=int, default=10,
+                       help="Размер страницы выдачи (демо-ключ: до 10, коммерческий: до 50)")
+    crawl.add_argument("--max-pages", type=int, default=5,
+                       help="Сколько страниц API позволяет пролистать (демо-ключ: 5)")
+    crawl.add_argument("--min-tile", type=float, default=0.002,
+                       help="Минимальный размер тайла в градусах. По умолчанию: 0.002 (~200 м)")
+    crawl.add_argument("--no-reviews", action="store_true", help="Не собирать отзывы")
+    crawl.add_argument("--fresh", action="store_true",
+                       help="Начать обход заново (сбросить очередь тайлов региона)")
+
+    reviews = sub.add_parser("reviews", parents=[common],
+                             help="Собрать отзывы по сохранённым филиалам")
+    reviews.add_argument("--region-id", type=int, default=None, help="Только филиалы региона")
+    reviews.add_argument("--only-missing", action="store_true",
+                         help="Только филиалы, по которым отзывы ещё не собирались")
 
     return parser.parse_args()
 
 
 def main():
     """Точка входа CLI."""
+    load_dotenv()
     args = parse_arguments()
     setup_logging(args.verbose)
 
     try:
-        asyncio.run(run_parser(args))
+        # psycopg в async-режиме не работает с ProactorEventLoop (Windows)
+        asyncio.run(run(args), loop_factory=asyncio.SelectorEventLoop)
     except KeyboardInterrupt:
-        logging.info("Работа программы прервана комбинацией клавиш Ctrl+C.")
+        logging.info("Работа прервана (Ctrl+C). Незавершённые задачи продолжатся при следующем запуске.")
 
 
 if __name__ == "__main__":
