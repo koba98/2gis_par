@@ -1,0 +1,15 @@
+# Запуск на сервере: docker compose run --rm parser <команда> ...
+# Например: docker compose run --rm parser catalog -r Астана
+# Лимиты подобраны по замерам: один воркер = Python ~20 МБ + Chrome до ~1,5 ГБ
+# (контекст браузера пересоздаётся каждые 150 страниц, память не копится).
+services:
+  parser:
+    build: .
+    env_file: .env                  # PG_DSN, PG_SCHEMA
+    network_mode: host              # доступ к PostgreSQL на хосте по localhost
+    shm_size: "512m"                # Chrome использует /dev/shm
+    mem_limit: "2g"                 # жёсткий потолок памяти на один воркер
+    cpus: "1.5"
+    volumes:
+      - ./output:/app/output        # CSV и кэш сканов районов
+    restart: "no"
