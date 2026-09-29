@@ -54,6 +54,7 @@ import json
 import logging
 import random
 import re
+import os
 import time
 import urllib.parse
 from pathlib import Path
@@ -119,12 +120,13 @@ SEARCH_QUERY = "остановка автобуса"
 # ---------------------------------------------------------------------------
 
 DB_CONFIG = {
-    "host": "192.168.10.120",       # например: "localhost" или IP корпоративного DWH-сервера
-    "port": 5432,
-    "dbname": "khc_dwh",
-    "user": "postgres",
-    "password": "khc12345678#$",
+    "host": os.getenv("PG_HOST", ""),
+    "port": int(os.getenv("PG_PORT", "5432")),
+    "dbname": os.getenv("PG_DB", ""),
+    "user": os.getenv("PG_USER", ""),
+    "password": os.getenv("PG_PASSWORD", ""),
 }
+
 
 DB_SCHEMA = "web_parsing"
 DB_TABLE = "2gis_bus_stations"  # имя начинается с цифры -> в SQL везде в двойных кавычках
