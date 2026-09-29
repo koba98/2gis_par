@@ -1,3 +1,2 @@
-aiohttp>=3.9.0
 psycopg[binary]>=3.1
-playwright>=1.40  # опционально: только для --browser-fallback (используется системный Chrome, playwright install не нужен)
+playwright>=1.40  # используется системный Chrome, `playwright install` не нужен
