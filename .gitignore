@@ -32,3 +32,9 @@ ENV/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Crawl output, logs and local debugging artifacts
+output/
+*.log
+_map*.png
+_probe.py
