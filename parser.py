@@ -121,6 +121,8 @@ TRANSPORT_QUERIES: Dict[str, List[str]] = {
     "trolleybus": ["троллейбус", "остановка троллейбуса"],
     "tram": ["трамвай", "трамвайная остановка"],
     "shuttle_bus": ["маршрутка"],
+    "light_metro": ["LRT", "ЛРТ", "станция LRT"],        # LRT «Tarlan Astana»: в 2ГИС тип light_metro
+    "suburban_train": ["электричка", "пригородный поезд"],
 }
 TRANSPORT_SUBTYPES = tuple(TRANSPORT_QUERIES)
 
@@ -448,10 +450,14 @@ def search_meta(state: Optional[dict]) -> Tuple[Optional[int], Optional[int], Li
 
 
 def stop_from_item(item: Dict[str, Any], city_slug: str, region: str, city: str) -> Optional[Dict[str, Any]]:
-    """Остановка/станция любого транспорта (автобус, метро, троллейбус, трамвай)."""
+    """
+    Остановка/станция любого транспорта. Обычно это type=station; станции LRT 2ГИС отдаёт
+    как карточку-организацию (type=branch) с route_type и списком маршрутов — они тоже станции.
+    """
     point = item.get("point")
-    subtype = item.get("subtype")
-    if not point or item.get("type") != "station":
+    subtype = item.get("subtype") or item.get("route_type")
+    is_station = item.get("type") == "station" or (item.get("route_type") and item.get("routes"))
+    if not point or not is_station:
         return None
     adm = {a.get("type"): (a.get("name") or "").replace("\xa0", " ")
            for a in item.get("adm_div") or [] if isinstance(a, dict)}
@@ -1308,7 +1314,7 @@ class DgisCrawler:
                 self.storage.set_web_task_result(city.slug, "transport", q,
                                                  "done" if run.complete else "incomplete", run.total, unique)
                 for item in self.in_city(city, items):
-                    if item.get("type") == "station":
+                    if item.get("type") == "station" or item.get("route_type"):
                         stop = stop_from_item(item, city.slug, city.region, city.name)
                         if stop:
                             stops[stop["id"]] = stop
@@ -1403,10 +1409,16 @@ class DgisCrawler:
         try:
             for idx, row in enumerate(rows, 1):
                 page = self.scraper.recycle(page)
-                html, _ = self.scraper.load_html(page, f"{SITE}/{city.slug}/geo/{row['id']}")
-                entity = state_entities(extract_initial_state(html or "")).get(str(row["id"]))
+                html, final_url = self.scraper.load_html(page, f"{SITE}/{city.slug}/geo/{row['id']}")
+                entities = state_entities(extract_initial_state(html or ""))
+                entity = entities.get(str(row["id"]))
+                if entity is None:
+                    # станции LRT и вокзалы сайт открывает как карточку-организацию станции
+                    m = re.search(r"/(?:firm|geo|station)/(\d+)", final_url or "")
+                    entity = entities.get(m.group(1)) if m else None
                 stop = stop_from_item(entity, city.slug, city.region, city.name) if entity else None
                 if stop:
+                    stop["id"] = str(row["id"])  # id остановки из маршрута — по нему связь с маршрутами
                     self.storage.save_transport_stops([stop])
                 else:
                     logger.warning("Остановка %s (%s) не получена", row["id"], row["name"])

@@ -462,6 +462,40 @@ SELECT
     adm_name(s.raw->'adm_div', 'living_area') AS microdistrict
 FROM transport_stops s;
 
+-- Тип транспорта по-русски (как его называет 2ГИС в subtype)
+CREATE OR REPLACE FUNCTION transport_type_ru(t text) RETURNS text
+LANGUAGE sql IMMUTABLE AS $$
+    SELECT CASE t
+        WHEN 'bus' THEN 'Автобус'
+        WHEN 'trolleybus' THEN 'Троллейбус'
+        WHEN 'tram' THEN 'Трамвай'
+        WHEN 'shuttle_bus' THEN 'Маршрутка'
+        WHEN 'metro' THEN 'Метро'
+        WHEN 'light_metro' THEN 'LRT'
+        WHEN 'suburban_train' THEN 'Электричка'
+        WHEN 'stop' THEN 'Остановка'
+        ELSE t
+    END
+$$;
+
+-- График работы из карточки 2ГИС одной строкой: «Пн 09:00–18:00; …; Вс выходной»
+CREATE OR REPLACE FUNCTION schedule_text(s jsonb) RETURNS text
+LANGUAGE sql IMMUTABLE AS $$
+    SELECT CASE
+        WHEN s IS NULL OR jsonb_typeof(s) <> 'object' THEN NULL
+        WHEN (s->>'is_24x7')::boolean THEN 'Круглосуточно' || coalesce(' (' || (s->>'comment') || ')', '')
+        ELSE (
+            SELECT string_agg(d.ru || ' ' || coalesce(
+                       (SELECT string_agg((h->>'from') || '–' || (h->>'to'), ', ')
+                        FROM jsonb_array_elements(CASE WHEN jsonb_typeof(s->d.en->'working_hours') = 'array'
+                                                       THEN s->d.en->'working_hours' ELSE '[]'::jsonb END) h),
+                       'выходной'), '; ' ORDER BY d.n)
+            FROM (VALUES (1, 'Mon', 'Пн'), (2, 'Tue', 'Вт'), (3, 'Wed', 'Ср'), (4, 'Thu', 'Чт'),
+                         (5, 'Fri', 'Пт'), (6, 'Sat', 'Сб'), (7, 'Sun', 'Вс')) AS d(n, en, ru)
+        ) || coalesce(' (' || (s->>'comment') || ')', '')
+    END
+$$;
+
 -- Маршрут -> остановки по порядку -> где каждая находится
 CREATE OR REPLACE VIEW v_route_stops_ordered AS
 SELECT
@@ -469,7 +503,8 @@ SELECT
     r.from_name AS route_from, r.to_name AS route_to, r.id AS route_id,
     p.direction_no, p.direction_type, p.seq,
     p.stop_id, p.stop_name, p.lat, p.lon,
-    s.region, s.district_area, s.locality, s.district, s.microdistrict
+    s.region, s.district_area, s.locality, s.district, s.microdistrict,
+    transport_type_ru(r.subtype) AS route_type_ru
 FROM transport_route_platforms p
 JOIN transport_routes r ON r.city_slug = p.city_slug AND r.id = p.route_id
 LEFT JOIN v_transport_stops s ON s.id = p.stop_id;
@@ -485,9 +520,121 @@ SELECT
         'locality', locality, 'district', district, 'microdistrict', microdistrict,
         'lat', lat, 'lon', lon) ORDER BY seq) AS stops,
     string_agg(seq || '. ' || coalesce(stop_name, '?'), ', ' ORDER BY seq) AS stops_text,
-    array_agg(DISTINCT locality) FILTER (WHERE locality IS NOT NULL) AS localities
+    array_agg(DISTINCT locality) FILTER (WHERE locality IS NOT NULL) AS localities,
+    route_type_ru
 FROM v_route_stops_ordered
-GROUP BY city_slug, route_type, route_number, route_from, route_to, route_id, direction_no, direction_type;
+GROUP BY city_slug, route_type, route_number, route_from, route_to, route_id, direction_no, direction_type,
+         route_type_ru;
+
+-- Карточка объекта одной строкой: где находится, контакты по типам, график, атрибуты, отзывы
+CREATE OR REPLACE VIEW v_objects AS
+SELECT
+    b.id,
+    coalesce(b.raw->>'type', 'branch') AS object_type,
+    b.name,
+    b.primary_rubric AS category,
+    b.rubrics,
+    o.name AS org_name,
+    o.branch_count AS org_branches,
+    coalesce(b.full_address_name, b.address_name) AS address,
+    b.address_comment,
+    b.postcode,
+    adm_name(b.raw->'adm_div', 'region') AS region,
+    adm_name(b.raw->'adm_div', 'district_area') AS district_area,
+    coalesce(adm_name(b.raw->'adm_div', 'city'), adm_name(b.raw->'adm_div', 'settlement'), b.city) AS locality,
+    coalesce(adm_name(b.raw->'adm_div', 'district'), b.district) AS district,
+    adm_name(b.raw->'adm_div', 'living_area') AS microdistrict,
+    b.lat,
+    b.lon,
+    b.building_id,
+    bld.name AS building_name,
+    b.rating,
+    b.review_count,
+    (SELECT count(*) FROM reviews r WHERE r.branch_id = b.id) AS reviews_collected,
+    c.phones,
+    c.whatsapp,
+    c.telegram,
+    c.instagram,
+    c.websites,
+    c.emails,
+    (SELECT jsonb_object_agg(z.type, z.vals) FROM (
+        SELECT x.type, jsonb_agg(coalesce(x.text, x.value) ORDER BY x.position) AS vals
+        FROM contacts x WHERE x.branch_id = b.id GROUP BY x.type) z) AS all_contacts,
+    schedule_text(b.schedule) AS schedule_text,
+    b.schedule,
+    (SELECT array_agg(a->>'name')
+     FROM jsonb_array_elements(CASE WHEN jsonb_typeof(b.attributes) = 'array' THEN b.attributes ELSE '[]'::jsonb END) g,
+          jsonb_array_elements(CASE WHEN jsonb_typeof(g->'attributes') = 'array' THEN g->'attributes' ELSE '[]'::jsonb END) a
+    ) AS attributes,
+    (SELECT sum((e->>'count')::int)
+     FROM jsonb_array_elements(CASE WHEN jsonb_typeof(b.raw->'external_content') = 'array'
+                                    THEN b.raw->'external_content' ELSE '[]'::jsonb END) e
+     WHERE e->>'type' = 'photo_album') AS photos_count,
+    'https://2gis.kz/' || coalesce(b.raw->>'city_alias', 'astana')
+        || CASE WHEN coalesce(b.raw->>'type', 'branch') = 'branch' THEN '/firm/' ELSE '/geo/' END || b.id AS url_2gis,
+    b.card_synced_at IS NOT NULL AS full_card,
+    b.card_synced_at,
+    b.reviews_synced_at,
+    b.updated_at
+FROM branches b
+LEFT JOIN organizations o ON o.id = b.org_id
+LEFT JOIN branches bld ON bld.id = b.building_id AND bld.id <> b.id
+LEFT JOIN LATERAL (
+    SELECT
+        array_agg(coalesce(x.text, x.value) ORDER BY x.position) FILTER (WHERE x.type = 'phone') AS phones,
+        array_agg(x.value ORDER BY x.position) FILTER (WHERE x.type = 'whatsapp') AS whatsapp,
+        array_agg(x.value ORDER BY x.position) FILTER (WHERE x.type = 'telegram') AS telegram,
+        array_agg(x.value ORDER BY x.position) FILTER (WHERE x.type = 'instagram') AS instagram,
+        array_agg(coalesce(x.url, x.value) ORDER BY x.position) FILTER (WHERE x.type = 'website') AS websites,
+        array_agg(x.value ORDER BY x.position) FILTER (WHERE x.type = 'email') AS emails
+    FROM contacts x WHERE x.branch_id = b.id
+) c ON true;
+
+-- Отзывы с объектом и комментариями (ответы организации, реплики) одной строкой
+CREATE OR REPLACE VIEW v_object_reviews AS
+SELECT
+    r.id AS review_id,
+    r.branch_id AS object_id,
+    b.name AS object_name,
+    b.primary_rubric AS category,
+    r.date_created,
+    r.rating,
+    r.user_name,
+    r.text,
+    r.likes_count,
+    r.photos_count,
+    r.is_verified,
+    (SELECT jsonb_agg(jsonb_build_object(
+                'author', rc.author_name, 'official', rc.is_official_answer,
+                'text', rc.text, 'date', rc.date_created) ORDER BY rc.date_created)
+     FROM review_comments rc WHERE rc.review_id = r.id) AS comments,
+    r.url
+FROM reviews r
+JOIN branches b ON b.id = r.branch_id;
+
+-- Здания и ЖК: что внутри (организации, площадки) списком
+CREATE OR REPLACE VIEW v_buildings AS
+SELECT
+    bld.id,
+    bld.name,
+    bld.address,
+    bld.locality,
+    bld.district,
+    bld.microdistrict,
+    bld.lat,
+    bld.lon,
+    bld.rating,
+    bld.review_count,
+    count(o.id) AS objects_inside,
+    jsonb_agg(jsonb_build_object(
+        'id', o.id, 'name', o.name, 'category', o.category, 'where', o.address_comment,
+        'phones', o.phones, 'rating', o.rating) ORDER BY o.category, o.name) FILTER (WHERE o.id IS NOT NULL) AS objects,
+    bld.url_2gis
+FROM v_objects bld
+LEFT JOIN v_objects o ON o.building_id = bld.id AND o.id <> bld.id
+WHERE bld.object_type = 'building'
+GROUP BY bld.id, bld.name, bld.address, bld.locality, bld.district, bld.microdistrict,
+         bld.lat, bld.lon, bld.rating, bld.review_count, bld.url_2gis;
 
 -- ============================================================================
 -- Описания (комментарии) таблиц и колонок на русском языке
@@ -667,6 +814,11 @@ COMMENT ON VIEW v_transport_stops IS 'Остановки с адресным п�
 COMMENT ON VIEW v_route_stops_ordered IS 'Маршрут -> остановки по порядку в каждом направлении -> населённый пункт, район и микрорайон каждой остановки';
 COMMENT ON VIEW v_routes IS 'Маршрут одной строкой на направление: тип, номер, откуда-куда, число остановок, остановки по порядку (stops — JSON с номером, названием, населённым пунктом, районом, координатами; stops_text — «1. …, 2. …»), населённые пункты на маршруте';
 COMMENT ON FUNCTION adm_name(jsonb, text) IS 'Название уровня адреса (region, district_area, city, settlement, district, living_area) из adm_div карточки 2ГИС';
+COMMENT ON FUNCTION transport_type_ru(text) IS 'Тип транспорта по-русски: bus → Автобус, light_metro → LRT, suburban_train → Электричка и т.д.';
+COMMENT ON FUNCTION schedule_text(jsonb) IS 'График работы из карточки 2ГИС одной строкой: «Пн 09:00–18:00; …; Вс выходной» или «Круглосуточно»';
+COMMENT ON VIEW v_objects IS 'Карточка объекта одной строкой: категория, организация, адрес и где находится (населённый пункт, район, микрорайон), здание, рейтинг, контакты по типам (телефоны, WhatsApp, Telegram, Instagram, сайты, email, все остальные в all_contacts), график текстом, атрибуты, фото, ссылка на 2ГИС';
+COMMENT ON VIEW v_object_reviews IS 'Отзывы с названием и категорией объекта и комментариями к ним (ответы организации и реплики пользователей) в JSON';
+COMMENT ON VIEW v_buildings IS 'Здания и ЖК: адрес, где находится и список всего, что внутри (организации, площадки) с категорией, местом в здании и телефонами';
 
 -- 12. web_crawl_tasks (Очередь и журнал полноты обхода)
 COMMENT ON TABLE web_crawl_tasks IS 'Очередь браузерного обхода 2ГИС и журнал полноты: по каждому запросу/рубрике/зданию — сколько объектов заявил 2ГИС и сколько собрано';
