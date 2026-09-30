@@ -62,6 +62,8 @@ class SyncStorage:
             return
         ddl = SCHEMA_FILE.read_text(encoding="utf-8")
         with self._conn.transaction():
+            # несколько воркеров стартуют одновременно: DDL выполняется по очереди
+            self._conn.execute("SELECT pg_advisory_xact_lock(hashtext('twogis_init_db'))")
             self._conn.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(self.schema)))
             self._conn.execute(sql.SQL("SET LOCAL search_path TO {}").format(sql.Identifier(self.schema)))
             self._conn.execute(ddl)
@@ -210,32 +212,63 @@ class SyncStorage:
                     )
         return len(branches)
 
+    _DETAIL_COLUMNS = """
+        id, coalesce(raw->>'type', 'branch') AS type, name, review_count, card_synced_at, reviews_synced_at
+    """
+
     def branches_without_card(self, ids: Sequence[int]) -> List[Dict[str, Any]]:
-        """Какие из объектов ещё без полной карточки (id, тип)."""
+        """Какие из объектов ещё без полной карточки."""
         if not self.connect() or not ids:
             return []
         cur = self._conn.execute(
-            """
-            SELECT id, coalesce(raw->>'type', 'branch') AS type, name FROM branches
+            f"""
+            SELECT {self._DETAIL_COLUMNS} FROM branches
             WHERE id = ANY(%s) AND card_synced_at IS NULL AND card_attempts < 3 ORDER BY id
             """,
             (list(ids),),
         )
         return list(cur.fetchall())
 
-    def city_branches_without_card(self, city: str, limit: Optional[int],
-                                   shard: Tuple[int, int] = (0, 1)) -> List[Dict[str, Any]]:
-        """Объекты города без полной карточки; shard=(i, n) — доля i из n для параллельных процессов."""
+    # что осталось собрать по объекту: полная карточка и/или лента отзывов
+    _NEEDS = {
+        "cards": "card_synced_at IS NULL AND card_attempts < 3",
+        "reviews": "coalesce(review_count, 0) > 0 AND reviews_synced_at IS NULL AND reviews_attempts < 3",
+    }
+    _NEEDS["details"] = f"(({_NEEDS['cards']}) OR ({_NEEDS['reviews']}))"
+
+    def objects_for_details(self, region_id: int, main_city: Optional[str], limit: Optional[int],
+                            need: str = "details", shard: Tuple[int, int] = (0, 1)) -> List[Dict[str, Any]]:
+        """
+        Объекты проекта (город + населённые пункты-спутники), которым не хватает карточки или отзывов.
+        Сначала сам город, потом спутники; внутри — объекты с большим числом отзывов первыми.
+        shard=(i, n) — доля i из n для параллельных процессов.
+        """
         if not self.connect():
             return []
         cur = self._conn.execute(
-            """
-            SELECT id, coalesce(raw->>'type', 'branch') AS type, name FROM branches
-            WHERE card_synced_at IS NULL AND card_attempts < 3 AND city = %s AND id %% %s = %s ORDER BY id LIMIT %s
+            f"""
+            SELECT {self._DETAIL_COLUMNS} FROM branches
+            WHERE region_id = %(region)s AND {self._NEEDS[need]} AND id %% %(n)s = %(i)s
+            ORDER BY (city IS DISTINCT FROM %(city)s), coalesce(review_count, 0) DESC, id
+            LIMIT %(limit)s
             """,
-            (city, shard[1], shard[0], limit),
+            {"region": region_id, "city": main_city, "limit": limit, "n": shard[1], "i": shard[0]},
         )
         return list(cur.fetchall())
+
+    def count_objects_for_details(self, region_id: int, need: str = "details") -> int:
+        if not self.connect():
+            return 0
+        return self._conn.execute(
+            f"SELECT count(*) AS n FROM branches WHERE region_id = %s AND {self._NEEDS[need]}", (region_id,)
+        ).fetchone()["n"]
+
+    def count_in_building(self, building_id: int) -> int:
+        """Сколько объектов с этим building_id уже в базе (для сверки с total вкладки «В здании»)."""
+        if not self.connect():
+            return 0
+        return self._conn.execute("SELECT count(*) AS n FROM branches WHERE building_id = %s AND id <> %s",
+                                  (building_id, building_id)).fetchone()["n"]
 
     def mark_card_synced(self, ids: Sequence[int]) -> None:
         if self.connect() and ids:
@@ -251,7 +284,7 @@ class SyncStorage:
         cur = self._conn.execute(
             """
             SELECT id, coalesce(raw->>'type', 'branch') AS type, name, review_count,
-                   building_id, lat, lon, reviews_synced_at
+                   building_id, lat, lon, reviews_synced_at, card_synced_at
             FROM branches WHERE id = ANY(%s)
             """,
             (list(ids),),
@@ -315,25 +348,6 @@ class SyncStorage:
                     [{**r, "raw": Jsonb(r["raw"])} for r in reviews],
                 )
         return len(reviews)
-
-    def branches_for_reviews(self, city: Optional[str], limit: Optional[int] = None,
-                             shard: Tuple[int, int] = (0, 1)) -> List[Dict[str, Any]]:
-        """Объекты с отзывами, по которым отзывы ещё не собирались (крупные первыми)."""
-        if not self.connect():
-            return []
-        cur = self._conn.execute(
-            """
-            SELECT id, coalesce(raw->>'type', 'branch') AS type, name, review_count FROM branches
-            WHERE coalesce(review_count, 0) > 0
-              AND reviews_synced_at IS NULL AND reviews_attempts < 3
-              AND (%(city)s::text IS NULL OR city = %(city)s)
-              AND id %% %(n)s = %(i)s
-            ORDER BY review_count DESC, id
-            LIMIT %(limit)s
-            """,
-            {"city": city, "limit": limit, "n": shard[1], "i": shard[0]},
-        )
-        return list(cur.fetchall())
 
     def mark_reviews_synced(self, branch_id: int) -> None:
         if self.connect():
@@ -548,6 +562,44 @@ class SyncStorage:
                 stops,
             )
 
+    def merge_stop(self, city_slug: str, keep_id: str, dup_id: str) -> None:
+        """Сливает дубль остановки в keep_id: связи с маршрутами переносятся, дубль удаляется."""
+        if not self.connect() or keep_id == dup_id:
+            return
+        with self._conn.transaction():
+            self._conn.execute(
+                """
+                DELETE FROM transport_route_stops d WHERE d.city_slug = %(c)s AND d.stop_id = %(dup)s
+                  AND EXISTS (SELECT 1 FROM transport_route_stops k
+                              WHERE k.city_slug = d.city_slug AND k.route_id = d.route_id AND k.stop_id = %(keep)s)
+                """,
+                {"c": city_slug, "keep": keep_id, "dup": dup_id},
+            )
+            self._conn.execute("UPDATE transport_route_stops SET stop_id = %s WHERE city_slug = %s AND stop_id = %s",
+                               (keep_id, city_slug, dup_id))
+            self._conn.execute("UPDATE transport_route_platforms SET stop_id = %s WHERE city_slug = %s AND stop_id = %s",
+                               (keep_id, city_slug, dup_id))
+            self._conn.execute("DELETE FROM transport_stops WHERE id = %s AND city_slug = %s", (dup_id, city_slug))
+
+    def merge_redirected_stops(self, city_slug: str) -> int:
+        """
+        Остановки, чья карточка — другой объект (станция LRT = организация «…, станция Tarlan Astana»),
+        и эта же станция, сохранённая из поиска под id организации: дубль сливается в остановку маршрута.
+        """
+        if not self.connect():
+            return 0
+        pairs = self._conn.execute(
+            """
+            SELECT s.id AS keep_id, d.id AS dup_id FROM transport_stops s
+            JOIN transport_stops d ON d.city_slug = s.city_slug AND d.id = split_part(s.raw->>'id', '_', 1)
+            WHERE s.city_slug = %s AND d.id <> s.id
+            """,
+            (city_slug,),
+        ).fetchall()
+        for p in pairs:
+            self.merge_stop(city_slug, p["keep_id"], p["dup_id"])
+        return len(pairs)
+
     _EXPORTS = {
         "stops": "SELECT id, name, subtype, lat, lon, region, district_area, locality, district, microdistrict "
                  "FROM v_transport_stops WHERE city_slug = %s ORDER BY locality, name",
@@ -692,6 +744,181 @@ class SyncStorage:
                 """,
                 (status, total, collected, city_slug, kind, str(key)),
             )
+
+    def web_task_done(self, city_slug: str, kind: str, key: str) -> bool:
+        if not self.connect():
+            return False
+        return self._conn.execute(
+            "SELECT 1 FROM web_crawl_tasks WHERE city_slug = %s AND kind = %s AND key = %s AND status = 'done'",
+            (city_slug, kind, key),
+        ).fetchone() is not None
+
+    def open_web_tasks(self, city_slug: str, kinds: Sequence[str], max_attempts: int) -> int:
+        """Задачи, которые ещё будут выполняться: в очереди, в работе или неполные с оставшимися попытками."""
+        if not self.connect():
+            return 0
+        return self._conn.execute(
+            """
+            SELECT count(*) AS n FROM web_crawl_tasks
+            WHERE city_slug = %s AND kind = ANY(%s)
+              AND (status IN ('pending', 'running') OR (status IN ('incomplete', 'error') AND attempts < %s))
+            """,
+            (city_slug, list(kinds), max_attempts),
+        ).fetchone()["n"]
+
+    def reset_exhausted(self, city_slug: str, region_id: int) -> Dict[str, int]:
+        """Добор: даёт ещё попытки задачам и объектам, у которых они кончились (неполные, с ошибкой)."""
+        if not self.connect():
+            return {}
+        with self._conn.transaction():
+            tasks = self._conn.execute(
+                """
+                UPDATE web_crawl_tasks SET status = 'pending', attempts = 0, updated_at = now()
+                WHERE city_slug = %s AND kind IN ('query', 'rubric', 'building') AND status IN ('incomplete', 'error')
+                """,
+                (city_slug,),
+            ).rowcount
+            cards = self._conn.execute(
+                "UPDATE branches SET card_attempts = 0 WHERE region_id = %s AND card_synced_at IS NULL AND card_attempts >= 3",
+                (region_id,),
+            ).rowcount
+            reviews = self._conn.execute(
+                """
+                UPDATE branches SET reviews_attempts = 0
+                WHERE region_id = %s AND reviews_synced_at IS NULL AND reviews_attempts >= 3
+                """,
+                (region_id,),
+            ).rowcount
+        return {"задач": tasks, "карточек": cards, "лент отзывов": reviews}
+
+    # ------------------------------------------------------------------ проекты 2ГИС (регионы)
+
+    def region_fresh(self, region_id: int, days: int = 7) -> bool:
+        if not self.connect():
+            return False
+        return self._conn.execute(
+            """
+            SELECT 1 FROM regions
+            WHERE id = %s AND updated_at > now() - make_interval(days => %s)
+              AND city_slug IS NOT NULL AND raw ? 'statistics'
+            """,
+            (region_id, days),
+        ).fetchone() is not None
+
+    def save_region(self, region_id: int, city_slug: str, data: Dict[str, Any],
+                    rings: List[List[Tuple[float, float]]]) -> None:
+        if not self.connect():
+            return
+        lons = [p[0] for r in rings for p in r] or [None]
+        lats = [p[1] for r in rings for p in r] or [None]
+        self._conn.execute(
+            """
+            INSERT INTO regions (id, city_slug, name, type, min_lon, min_lat, max_lon, max_lat, raw)
+            VALUES (%(id)s, %(slug)s, %(name)s, %(type)s, %(min_lon)s, %(min_lat)s, %(max_lon)s, %(max_lat)s, %(raw)s)
+            ON CONFLICT (id) DO UPDATE SET
+                city_slug = excluded.city_slug, name = excluded.name, type = excluded.type,
+                min_lon = excluded.min_lon, min_lat = excluded.min_lat,
+                max_lon = excluded.max_lon, max_lat = excluded.max_lat,
+                raw = excluded.raw, updated_at = now()
+            """,
+            {
+                "id": region_id, "slug": city_slug, "name": data.get("name") or "", "type": data.get("type"),
+                "min_lon": min(lons) if lons[0] is not None else None,
+                "min_lat": min(lats) if lats[0] is not None else None,
+                "max_lon": max(lons) if lons[0] is not None else None,
+                "max_lat": max(lats) if lats[0] is not None else None,
+                "raw": Jsonb(data),
+            },
+        )
+
+    def completeness(self) -> List[Dict[str, Any]]:
+        """Полнота по городам: заявлено 2ГИС (statistics проекта) / собрано, карточки, отзывы, очередь."""
+        if not self.connect():
+            return []
+        return list(self._conn.execute("SELECT * FROM v_city_completeness ORDER BY declared_branches DESC NULLS LAST"))
+
+    # ------------------------------------------------------------------ план обхода kz: город × этап
+
+    def init_plan(self, jobs: Iterable[Tuple[str, str, int, int]]) -> None:
+        """Добавляет в план (город, этап, волна, порядок); уже известные задачи сохраняют статус."""
+        rows = [{"city": c, "stage": s, "tier": t, "position": p} for c, s, t, p in jobs]
+        if not rows or not self.connect():
+            return
+        with self._conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO crawl_plan (city_slug, stage, tier, position)
+                VALUES (%(city)s, %(stage)s, %(tier)s, %(position)s)
+                ON CONFLICT (city_slug, stage) DO UPDATE SET tier = excluded.tier, position = excluded.position
+                """,
+                rows,
+            )
+
+    def claim_plan_job(self, tiers: Sequence[int], worker: str, stale_minutes: int = 45) -> Optional[Dict[str, Any]]:
+        """
+        Следующий этап по порядку плана. Этап города берётся, только когда все предыдущие этапы
+        этого города выполнены; этапы, «зависшие» у упавшего воркера, возвращаются в работу.
+        Несколько воркеров (с разными IP) берут разные этапы — FOR UPDATE SKIP LOCKED.
+        """
+        if not self.connect():
+            return None
+        with self._conn.transaction():
+            self._conn.execute(
+                """
+                UPDATE crawl_plan SET status = 'pending', worker = NULL
+                WHERE status = 'running' AND updated_at < now() - make_interval(mins => %s)
+                """,
+                (stale_minutes,),
+            )
+            return self._conn.execute(
+                """
+                UPDATE crawl_plan SET status = 'running', worker = %(worker)s, attempts = attempts + 1,
+                    started_at = coalesce(started_at, now()), updated_at = now()
+                WHERE (city_slug, stage) = (
+                    SELECT p.city_slug, p.stage FROM crawl_plan p
+                    WHERE p.status = 'pending' AND p.tier = ANY(%(tiers)s)
+                      AND (p.not_before IS NULL OR p.not_before <= now())
+                      AND NOT EXISTS (
+                          SELECT 1 FROM crawl_plan q
+                          WHERE q.city_slug = p.city_slug AND q.position < p.position AND q.status <> 'done')
+                    ORDER BY p.position
+                    LIMIT 1 FOR UPDATE SKIP LOCKED
+                )
+                RETURNING city_slug, stage, tier, attempts
+                """,
+                {"tiers": list(tiers), "worker": worker},
+            ).fetchone()
+
+    def finish_plan_job(self, city_slug: str, stage: str, status: str, error: Optional[str] = None,
+                        delay_minutes: int = 0) -> None:
+        """status: done — этап выполнен; pending — вернуть в очередь (через delay_minutes)."""
+        if self.connect():
+            self._conn.execute(
+                """
+                UPDATE crawl_plan SET status = %s, last_error = %s, worker = NULL, updated_at = now(),
+                    finished_at = CASE WHEN %s = 'done' THEN now() END,
+                    not_before = now() + make_interval(mins => %s)
+                WHERE city_slug = %s AND stage = %s
+                """,
+                (status, error, status, delay_minutes, city_slug, stage),
+            )
+
+    def touch_plan_job(self, city_slug: str, stage: str) -> None:
+        if self.connect():
+            self._conn.execute("UPDATE crawl_plan SET updated_at = now() WHERE city_slug = %s AND stage = %s",
+                               (city_slug, stage))
+
+    def plan_status(self) -> List[Dict[str, Any]]:
+        if not self.connect():
+            return []
+        return list(self._conn.execute(
+            """
+            SELECT tier, city_slug, stage, status, attempts, worker,
+                   started_at::timestamp(0) AS started, finished_at::timestamp(0) AS finished,
+                   left(last_error, 80) AS error
+            FROM crawl_plan ORDER BY position
+            """
+        ))
 
     def touch_web_task(self, task_id: int) -> None:
         """Отметка «задача жива» для длинных задач (сотни страниц), чтобы её не сбросили как зависшую."""

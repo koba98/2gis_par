@@ -43,6 +43,8 @@ SITE = "https://2gis.kz"
 
 COOLDOWN = (1.5, 2.6)          # пауза после загрузки страницы / клика по пагинации
 SHORT_COOLDOWN = (0.6, 1.2)    # пауза между «Загрузить ещё»
+HTTP_COOLDOWN = (0.8, 1.6)     # пауза после HTTP-запроса HTML: один запрос вместо страницы с десятками XHR
+API_COOLDOWN = (0.25, 0.6)     # пауза между запросами ленты отзывов и комментариев
 LOAD_MORE = re.compile("Загрузить ещё|Показать ещё")
 LONG_BREAK_EVERY = 150         # каждые N действий — длинный перерыв
 LONG_BREAK = (25.0, 50.0)
@@ -89,31 +91,43 @@ VIEWPORTS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Регионы Казахстана: название региона -> (город, slug на 2gis.kz)
+# Проекты (города) 2ГИС в Казахстане
 # ---------------------------------------------------------------------------
 
-REGIONS: Dict[str, Tuple[str, str]] = {
-    "Астана": ("Астана", "astana"),
-    "Алматы": ("Алматы", "almaty"),
-    "Шымкент": ("Шымкент", "shymkent"),
-    "Акмолинская область": ("Кокшетау", "kokshetau"),
-    "Актюбинская область": ("Актобе", "aktobe"),
-    "Алматинская область": ("Талдыкорган", "taldykorgan"),
-    "Атырауская область": ("Атырау", "atyrau"),
-    "Восточно-Казахстанская область": ("Усть-Каменогорск", "ust-kamenogorsk"),
-    "Жамбылская область": ("Тараз", "taraz"),
-    "Жетысуская область": ("Талдыкорган", "taldykorgan"),
-    "Западно-Казахстанская область": ("Уральск", "uralsk"),
-    "Карагандинская область": ("Караганда", "karaganda"),
-    "Костанайская область": ("Костанай", "kostanay"),
-    "Кызылординская область": ("Кызылорда", "kyzylorda"),
-    "Мангистауская область": ("Актау", "aktau"),
-    "Павлодарская область": ("Павлодар", "pavlodar"),
-    "Северо-Казахстанская область": ("Петропавловск", "petropavlovsk"),
-    "Туркестанская область": ("Туркестан", "turkestan"),
-    "Улытауская область": ("Жезказган", "zhezkazgan"),
-    "Абайская область": ("Семей", "semey"),
-}
+@dataclass(frozen=True)
+class City:
+    region: str
+    name: str
+    slug: str
+    region_id: Optional[str] = None  # region_id проекта 2ГИС: по нему отбрасываются объекты чужих городов
+    tier: int = 2                    # волна обхода kz: 1 — крупные города, 2 — областные центры, 3 — малые города
+
+
+# Все проекты 2gis.kz (проверено: у каждого своя страница и region_id; slug «taldykorgan» не существует —
+# Талдыкорган, Конаев, Жаркент и др. входят в проект Алматы). В проект входят и населённые
+# пункты-спутники (у Астаны — Косшы, Талапкер…, у Шымкента — Ленгер, Арысь…): их объекты
+# приходят в той же выдаче. Внутри волны — по убыванию числа объектов по данным 2ГИС.
+CITIES: List[City] = [
+    City("Алматы", "Алматы", "almaty", "67", 1),                                 # 150 тыс. объектов
+    City("Астана", "Астана", "astana", "68", 1),                                 # 93 тыс.
+    City("Шымкент", "Шымкент", "shymkent", "161", 1),                            # 65 тыс.
+    City("Карагандинская область", "Караганда", "karaganda", "84", 2),
+    City("Мангистауская область", "Актау", "aktau", "196", 2),
+    City("Павлодарская область", "Павлодар", "pavlodar", "111", 2),
+    City("Актюбинская область", "Актобе", "aktobe", "167", 2),
+    City("Костанайская область", "Костанай", "kostanay", "203", 2),
+    City("Акмолинская область", "Кокшетау", "kokshetau", "201", 2),
+    City("Атырауская область", "Атырау", "atyrau", "168", 2),
+    City("Абайская область", "Семей", "semey", "169", 2),
+    City("Западно-Казахстанская область", "Уральск", "uralsk", "162", 2),
+    City("Восточно-Казахстанская область", "Усть-Каменогорск", "ust-kamenogorsk", "91", 2),
+    City("Жамбылская область", "Тараз", "taraz", "221", 2),
+    City("Кызылординская область", "Кызылорда", "kyzylorda", "240", 2),
+    City("Северо-Казахстанская область", "Петропавловск", "petropavlovsk", "170", 2),
+    City("Туркестанская область", "Туркестан", "turkestan", "232", 3),            # 8 тыс.
+    City("Павлодарская область", "Экибастуз", "ekibastuz", "252", 3),             # 6 тыс.
+    City("Улытауская область", "Жезказган", "zhezkazgan", "242", 3),              # 5 тыс.
+]
 
 TRANSPORT_QUERIES: Dict[str, List[str]] = {
     "bus": ["остановка автобуса", "автобус"],
@@ -409,23 +423,86 @@ def extract_initial_state(html_text: str, var: str = "initialState") -> Optional
 _JS_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "v": "\v", "0": "\0"}
 
 
-def embedded_reviews(html_text: str) -> List[Dict[str, Any]]:
+@dataclass
+class ReviewFeed:
+    items: List[Dict[str, Any]]
+    next_link: Optional[str]  # следующая страница ленты в API отзывов (None — лента кончилась)
+    total: Optional[int] = None  # всего отзывов у объекта, включая отзывы без оценки
+    kind: str = "branch"         # branch | geo — раздел API отзывов
+
+
+def embedded_review_feed(html_text: str) -> Optional[ReviewFeed]:
     """
-    Первая страница отзывов (до 50), встроенная в `__REACT_QUERY_STATE__`.
+    Первая страница отзывов (до 50), встроенная в `__REACT_QUERY_STATE__` страницы /tab/reviews,
+    и ссылка на следующую. None — ленты на странице нет (не та вкладка или у объекта нет отзывов).
     Блок есть, но не разобрался — исключение: иначе объект сочтётся «без отзывов».
     """
     state = extract_initial_state(html_text, "__REACT_QUERY_STATE__")
     if state is None:
         if "var __REACT_QUERY_STATE__" in html_text:
             raise RuntimeError("не удалось разобрать встроенные отзывы (__REACT_QUERY_STATE__)")
-        return []
-    reviews = []
+        return None
+    feed: Optional[ReviewFeed] = None
     for query in state.get("queries") or []:
-        if (query.get("queryKey") or [None])[0] != "fetchEntityReviews":
+        query_key = query.get("queryKey") or [None]
+        if query_key[0] != "fetchEntityReviews":
             continue
+        entity_kind = query_key[1][1] if len(query_key) > 1 and len(query_key[1] or []) > 1 else "branch"
+        feed = feed or ReviewFeed([], None, kind=entity_kind or "branch")
         for pg in ((query.get("state") or {}).get("data") or {}).get("pages") or []:
-            reviews.extend(r for r in (pg or {}).get("items") or [] if isinstance(r, dict) and r.get("id"))
-    return reviews
+            pg = pg or {}
+            feed.items.extend(r for r in pg.get("items") or [] if isinstance(r, dict) and r.get("id"))
+            feed.next_link = pg.get("next_link") if pg.get("hasMore") else None
+            if pg.get("total") is not None:
+                feed.total = int(pg["total"])
+    return feed
+
+
+REVIEW_FIELDS = {
+    "branch": "meta.providers,meta.branch_rating,meta.branch_reviews_count,meta.total_count,"
+              "reviews.hiding_reason,reviews.emojis,reviews.trust_factors",
+    "geo": "meta.providers,meta.geo_rating,meta.geo_reviews_count,meta.total_count,"
+           "reviews.hiding_reason,reviews.emojis,reviews.trust_factors",
+}
+
+
+def full_review_feed_link(feed: ReviewFeed, obj_id: Any, key: Optional[str]) -> Optional[str]:
+    """
+    Первая страница полной ленты отзывов. Встроенная в страницу лента и её next_link — только
+    отзывы с оценкой (rated=true); отзывы без оценки сайт догружает отдельным запросом. Без
+    параметра rated API отдаёт всё сразу (проверено: 568 из 568 против 551 с rated=true).
+    """
+    if feed.next_link:
+        parsed = urllib.parse.urlparse(feed.next_link)
+        query = [(k, v) for k, v in urllib.parse.parse_qsl(parsed.query) if k != "rated"]
+        query = [(k, "0" if k == "offset" else v) for k, v in query]
+        return parsed._replace(query=urllib.parse.urlencode(query)).geturl()
+    if not key:
+        return None
+    section = "geo" if feed.kind == "geo" else "branches"
+    return f"{REVIEWS_API}/3.0/{section}/{obj_id}/reviews?" + urllib.parse.urlencode({
+        "fields": REVIEW_FIELDS.get(feed.kind, REVIEW_FIELDS["branch"]), "is_advertiser": "false",
+        "key": key, "limit": 50, "locale": "ru_KZ", "offset": 0, "sort_by": "trust",
+    })
+
+
+def embedded_reviews(html_text: str) -> List[Dict[str, Any]]:
+    feed = embedded_review_feed(html_text)
+    return feed.items if feed else []
+
+
+REVIEWS_API = "https://public-api.reviews.2gis.com"
+REVIEWS_API_KEY = re.compile(r'"reviewApiKey":"([0-9a-f-]{36})"'
+                             r"|public-api\.reviews\.2gis\.com[^\"'\s]*?[?&]key=([0-9a-f-]{36})")
+
+
+def reviews_api_key(*texts: Optional[str]) -> Optional[str]:
+    """Ключ API отзывов, которым пользуется сам сайт (есть в next_link и в коде страницы)."""
+    for text in texts:
+        m = REVIEWS_API_KEY.search(text or "")
+        if m:
+            return m.group(1) or m.group(2)
+    return None
 
 
 def state_entities(state: Optional[dict]) -> Dict[str, Dict[str, Any]]:
@@ -447,6 +524,31 @@ def search_meta(state: Optional[dict]) -> Tuple[Optional[int], Optional[int], Li
         first_ids = [str(i) for i in (((v or {}).get("1") or {}).get("data") or [])]
         break
     return total, pages, first_ids
+
+
+def inside_meta(state: Optional[dict], building_id: str) -> Tuple[Optional[int], List[str]]:
+    """(total, id первой страницы) вкладки «В здании», встроенной в страницу /geo/{id}/tab/inside."""
+    search = ((state or {}).get("data") or {}).get("search") or {}
+    for key, v in (search.get("profile") or {}).items():
+        d = (v or {}).get("data") or {}
+        if d.get("searchSourceType") == "firmsInBuilding" and str(d.get("buildingId")) == str(building_id):
+            page1 = (((search.get("pagination") or {}).get(key) or {}).get("1") or {}).get("data") or []
+            return d.get("total"), [str(i) for i in page1]
+    return None, []
+
+
+def pick_entity(html: Optional[str], final_url: str, obj_id: Any) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
+    """
+    Карточка объекта со страницы и её id. Здание с одной организацией, станцию LRT и т.п.
+    сайт перенаправляет на карточку другого объекта — тогда берётся он (id из итогового URL).
+    """
+    entities = state_entities(extract_initial_state(html or ""))
+    if str(obj_id) in entities:
+        return entities[str(obj_id)], int(obj_id)
+    m = re.search(r"/(?:firm|geo|station)/(\d+)", final_url or "")
+    if m and m.group(1) in entities:
+        return entities[m.group(1)], int(m.group(1))
+    return None, None
 
 
 def stop_from_item(item: Dict[str, Any], city_slug: str, region: str, city: str) -> Optional[Dict[str, Any]]:
@@ -574,10 +676,13 @@ class DgisBrowserScraper:
     """
 
     def __init__(self, headless: bool = False, channel: Optional[str] = "chrome",
-                 proxies: Optional[List[str]] = None, map_mode: bool = False):
+                 proxies: Optional[List[str]] = None, map_mode: bool = False,
+                 pace_factor: float = 1.0, captcha_wait: int = CAPTCHA_WAIT_SEC):
         self.headless = headless
         self.channel = channel
         self.map_mode = map_mode  # скан карты района требует WebGL; остальным режимам GPU не нужен
+        self.pace_factor = pace_factor    # множитель всех антибан-пауз
+        self.captcha_wait = captcha_wait  # сколько ждать решения капчи человеком; 0 — сервер без человека
         self.proxies = [p.strip() for p in proxies or [] if p.strip()]
         self._proxy_idx = 0
         self._actions = 0
@@ -641,11 +746,11 @@ class DgisBrowserScraper:
         """Пауза после действия; каждые LONG_BREAK_EVERY действий — длинный перерыв."""
         self._actions += 1
         if self._actions % LONG_BREAK_EVERY == 0:
-            pause = random.uniform(*LONG_BREAK)
+            pause = random.uniform(*LONG_BREAK) * self.pace_factor
             logger.info("Антибан: перерыв %.0f сек после %d действий", pause, self._actions)
             time.sleep(pause)
         else:
-            _pause(bounds)
+            time.sleep(random.uniform(*bounds) * self.pace_factor)
 
     def load_page(self, page: Page, url: str, retries: int = 3) -> Optional[str]:
         """
@@ -693,10 +798,55 @@ class DgisBrowserScraper:
         html = self.load_page(page, url)
         return html, page.url
 
+    def fetch_html(self, page: Page, url: str) -> Tuple[Optional[str], str]:
+        """
+        HTML страницы обычным HTTP-запросом из контекста браузера (те же куки и прокси).
+        Сервер 2ГИС отдаёт initialState уже в HTML, поэтому рендер не нужен: ~0,5 с вместо
+        загрузки страницы с десятками XHR. Капча, заглушка «обновите браузер», блокировка
+        или сбой — страница открывается в браузере (load_page: ожидание капчи и сети).
+        Возвращает (HTML, итоговый URL после редиректов).
+        """
+        for attempt in range(2):
+            try:
+                resp = page.context.request.get(url, timeout=30000)
+                html = resp.text()
+            except Exception as e:
+                logger.debug("HTTP %s: %s (попытка %d)", url, e, attempt + 1)
+                if NETWORK_ERROR.search(str(e)):
+                    break  # ожидание сети — в load_page
+                _pause(COOLDOWN)
+                continue
+            if resp.status == 404:
+                return html, resp.url  # объекта больше нет
+            if resp.status == 200 and "var initialState" in html and not _looks_like_captcha(html):
+                return html, resp.url
+            logger.debug("HTTP %s: статус %s, капча %s — открываем в браузере", url, resp.status,
+                         _looks_like_captcha(html))
+            break
+        return self.load_html(page, url)
+
+    def fetch_json(self, page: Page, url: str) -> Optional[Dict[str, Any]]:
+        """JSON из API, к которому обращается сам сайт (лента отзывов), с заголовками сайта. None — не удалось."""
+        for attempt in range(3):
+            try:
+                resp = page.context.request.get(url, headers={"Referer": f"{SITE}/", "Origin": SITE}, timeout=30000)
+                if resp.status == 200:
+                    return resp.json()
+                logger.debug("API %s: статус %s", url, resp.status)
+                if resp.status != 429:
+                    return None
+                time.sleep(random.uniform(20, 40) * self.pace_factor)  # 429 — слишком часто, ждём
+            except Exception as e:
+                logger.debug("API %s: %s (попытка %d)", url, e, attempt + 1)
+                _pause(COOLDOWN)
+        return None
+
     def _wait_captcha(self, page: Page, url: str) -> str:
+        if self.captcha_wait <= 0:
+            raise CaptchaBlockedError(f"2ГИС показал капчу на {url}")
         logger.warning("2ГИС показал капчу на %s — решите её в окне браузера (ждём %d сек)",
-                       url, CAPTCHA_WAIT_SEC)
-        deadline = time.monotonic() + CAPTCHA_WAIT_SEC
+                       url, self.captcha_wait)
+        deadline = time.monotonic() + self.captcha_wait
         while time.monotonic() < deadline:
             page.wait_for_timeout(1000)
             html = page.content()
@@ -712,13 +862,6 @@ class DgisBrowserScraper:
 # ---------------------------------------------------------------------------
 # Краулер
 # ---------------------------------------------------------------------------
-
-@dataclass
-class City:
-    region: str
-    name: str
-    slug: str
-
 
 @dataclass
 class SearchRun:
@@ -767,15 +910,17 @@ class DgisCrawler:
         self.storage = storage
         self.out_dir = Path(out_dir)
         self._region_ids: Dict[str, str] = {}  # slug города -> region_id 2ГИС (город + пригороды)
+        self.heartbeat: Callable[[], None] = lambda: None  # «работа идёт» для очереди kz
 
     def in_city(self, city: City, items: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Отбрасывает объекты чужих регионов: когда своя выдача кончается, 2ГИС дописывает
-        результаты из других городов. region_id города берётся с объекта, у которого
-        city_alias совпадает со slug города (у пригородов Астаны свой alias, но тот же region_id).
+        результаты из других городов (и стран — так в базу раньше попадали Бишкек и Токмок).
+        region_id проекта известен заранее (CITIES); иначе берётся с объекта, у которого
+        city_alias совпадает со slug города (у пригородов свой alias, но тот же region_id).
         """
         items = list(items)
-        rid = self._region_ids.get(city.slug)
+        rid = city.region_id or self._region_ids.get(city.slug)
         if rid is None:
             rid = next((str(i["region_id"]) for i in items
                         if i.get("city_alias") == city.slug and i.get("region_id") is not None), None)
@@ -792,7 +937,20 @@ class DgisCrawler:
         """
         Проходит все страницы выдачи кликами. Страница 1 — из initialState,
         остальные — из XHR /3.0/items, который сайт запрашивает при клике.
+        Выдача в одну страницу (мелкие рубрики, малые города) берётся HTTP-запросом без рендера.
         """
+        html, _ = self.scraper.fetch_html(page, url)
+        state = extract_initial_state(html or "")
+        if state is not None:
+            entities = state_entities(state)
+            total, pages, first_ids = search_meta(state)
+            if total is None:
+                items = list(entities.values())  # запрос открыл одну карточку напрямую
+                return SearchRun(items, len(items), 1, 1)
+            if (pages or 1) <= 1:
+                return SearchRun([entities[i] for i in first_ids if i in entities], total, 1, 1)
+        self.scraper.pace(HTTP_COOLDOWN)
+
         by_page: Dict[int, List[Dict[str, Any]]] = {}
 
         def sink(qs: Dict[str, List[str]], result: Dict[str, Any]) -> None:
@@ -826,9 +984,12 @@ class DgisCrawler:
                 self.scraper.pace()
                 got = self._click_page(page, page_no, by_page)
                 if got is None:
-                    if last_len < SEARCH_PAGE_SIZE:
-                        # неполная предыдущая страница и дальше ссылок нет — выдача кончилась,
-                        # хотя 2ГИС заявлял больше страниц (счётчик у него бывает завышен)
+                    unique = len({str(i.get("id")) for i in items})
+                    if last_len < SEARCH_PAGE_SIZE and unique >= (total or 0) * 0.95:
+                        # неполная предыдущая страница, дальше ссылок нет и собрано почти всё
+                        # заявленное — выдача кончилась (счётчик 2ГИС бывает чуть завышен).
+                        # Короткая страница посреди выдачи — это сбой, а не конец: задача останется
+                        # неполной и повторится (раньше так «остановка троллейбуса» дала done при 377 из 1468).
                         logger.info("Выдача закончилась на стр. %d (2ГИС заявлял %d): %s",
                                     page_no - 1, pages_total, url)
                         return SearchRun(items, total, pages_total, pages_done, ended=True)
@@ -837,8 +998,10 @@ class DgisCrawler:
                 items.extend(got)
                 last_len = len(got)
                 pages_done = page_no
-                if heartbeat and page_no % 20 == 0:
-                    heartbeat()
+                if page_no % 20 == 0:
+                    if heartbeat:
+                        heartbeat()
+                    self.heartbeat()
             return SearchRun(items, total, pages_total, pages_done)
         finally:
             page.remove_listener("response", listener)
@@ -864,41 +1027,48 @@ class DgisCrawler:
     # ------------------------------------------------------------------ здание / ЖК
 
     def crawl_building(self, page: Page, city: City, building_id: str
-                       ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int]:
+                       ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int, int]:
         """
         Карточка здания + всё, что 2ГИС показывает на вкладке «В здании».
-        Возвращает (сущности со страницы, объекты «В здании», сколько их заявил 2ГИС).
+        Возвращает (сущности со страницы, объекты «В здании», сколько их заявил 2ГИС, сколько есть).
+        1. HTTP /geo/{id}/tab/inside: полная карточка здания, total и первая страница списка (12).
+        2. Всё уместилось на первой странице — готово.
+        3. В БД уже не меньше total объектов с этим building_id (найдены по рубрикам) — готово.
+        4. Иначе вкладка в браузере и «Загрузить ещё» до total.
         Здание с одной организацией сайт открывает как карточку этой организации (/firm/…):
-        тогда сохраняется она, а вкладка «В здании» ищется уже на её странице.
+        списка «В здании» там нет, сохраняется сама организация.
         """
-        items: Dict[str, Dict[str, Any]] = {}
-        totals: List[int] = []
+        url = f"{SITE}/{city.slug}/geo/{building_id}/tab/inside"
+        html, _ = self.scraper.fetch_html(page, url)
+        state = extract_initial_state(html or "")
+        entities = state_entities(state)
+        if not entities:
+            raise RuntimeError("карточка здания не загрузилась или не разобралась")
+        on_page = list(entities.values())
+        total, first_ids = inside_meta(state, building_id)
+        if total is None:
+            return on_page, [], 0, 0  # в здании нет организаций
+        items = {str(_to_int(entities[i].get("id"))): entities[i] for i in first_ids if i in entities}
+        if len(items) >= total:
+            return on_page, list(items.values()), total, len(items)
+        known = self.storage.count_in_building(int(building_id))
+        if known >= total:
+            return on_page, list(items.values()), total, known
 
         def sink(qs: Dict[str, List[str]], result: Dict[str, Any]) -> None:
             if qs.get("building_id", [None])[0] != building_id:
                 return
-            if result.get("total") is not None:
-                totals.append(int(result["total"]))
             for it in result.get("items") or []:
                 items[str(_to_int(it.get("id")))] = it
 
         listener = _items_listener(sink)
         page.on("response", listener)
         try:
-            html = self.scraper.load_page(page, f"{SITE}/{city.slug}/geo/{building_id}")
-            entities = state_entities(extract_initial_state(html or ""))
-            if not entities:
-                raise RuntimeError("карточка здания не загрузилась или не разобралась")
-            on_page = list(entities.values())
-            tab = page.locator("a[href*='/tab/inside']")
-            if tab.count() == 0:
-                return on_page, [], 0  # в здании нет организаций
-            tab.first.click(timeout=8000)
-            if not _wait_for(page, lambda: bool(totals), XHR_WAIT_SEC):
-                raise RuntimeError("вкладка «В здании» не вернула список")
-            total = totals[0]
+            self.scraper.pace(HTTP_COOLDOWN)
+            if self.scraper.load_page(page, url) is None:
+                raise RuntimeError("вкладка «В здании» не загрузилась")
             self._load_more(page, lambda: len(items), total)
-            return on_page, list(items.values()), total
+            return on_page, list(items.values()), total, len(items)
         finally:
             page.remove_listener("response", listener)
 
@@ -932,18 +1102,28 @@ class DgisCrawler:
     # ------------------------------------------------------------------ каталог
 
     def discover_rubrics(self, page: Page, city: City) -> List[Tuple[str, str]]:
-        """Рубрики из рубрикатора города: /rubrics -> разделы -> /search/<имя>/rubricId/<id>."""
-        html = self.scraper.load_page(page, f"{SITE}/{city.slug}/rubrics")
-        if not html:
-            return []
-        metas = list(dict.fromkeys(re.findall(rf'href="/{city.slug}/rubrics/subrubrics/(\d+)"', html)))
+        """
+        Рубрики из рубрикатора города: /rubrics -> разделы -> подразделы (любой вложенности) ->
+        /search/<имя>/rubricId/<id>. Обход только верхних разделов давал меньше: в Астане
+        19 разделов, но 91 страница подразделов и 1384 рубрики.
+        """
+        pattern_sub = re.compile(rf'href="/{re.escape(city.slug)}/rubrics/subrubrics/(\d+)"')
+        pattern_leaf = re.compile(rf'href="/{re.escape(city.slug)}/search/([^"/]+)/rubricId/(\d+)"')
+        html, _ = self.scraper.fetch_html(page, f"{SITE}/{city.slug}/rubrics")
+        queue = list(dict.fromkeys(pattern_sub.findall(html or "")))
+        seen: set = set()
         found: Dict[str, str] = {}
-        for meta_id in metas:
-            self.scraper.pace()
-            sub = self.scraper.load_page(page, f"{SITE}/{city.slug}/rubrics/subrubrics/{meta_id}")
-            for raw_name, rid in re.findall(rf'href="/{city.slug}/search/([^"/]+)/rubricId/(\d+)"', sub or ""):
+        while queue:
+            sub_id = queue.pop(0)
+            if sub_id in seen:
+                continue
+            seen.add(sub_id)
+            self.scraper.pace(HTTP_COOLDOWN)
+            sub, _ = self.scraper.fetch_html(page, f"{SITE}/{city.slug}/rubrics/subrubrics/{sub_id}")
+            queue.extend(s for s in dict.fromkeys(pattern_sub.findall(sub or "")) if s not in seen)
+            for raw_name, rid in pattern_leaf.findall(sub or ""):
                 found.setdefault(rid, urllib.parse.unquote(raw_name))
-        logger.info("Рубрикатор %s: разделов %d, рубрик %d", city.slug, len(metas), len(found))
+        logger.info("Рубрикатор %s: страниц разделов %d, рубрик %d", city.slug, len(seen), len(found))
         return list(found.items())
 
     def _ingest(self, city: City, items: Iterable[Dict[str, Any]], default_category: Optional[str],
@@ -1000,9 +1180,14 @@ class DgisCrawler:
         try:
             if queries:
                 self.storage.add_web_tasks(city.slug, "query", ((q, q) for q in queries))
-            else:
-                self.storage.add_web_tasks(city.slug, "rubric", self.discover_rubrics(page, city))
+            elif not self.storage.web_task_done(city.slug, "rubricator", "all"):
+                # рубрикатор — один раз на город; новые рубрики потом приходят «снежным комом»
+                self.storage.add_web_tasks(city.slug, "rubricator", [("all", "рубрикатор")])
+                rubrics = self.discover_rubrics(page, city)
+                self.storage.add_web_tasks(city.slug, "rubric", rubrics)
                 self.storage.add_web_tasks(city.slug, "query", ((q, q) for q in SEED_QUERIES))
+                if rubrics:
+                    self.storage.set_web_task_result(city.slug, "rubricator", "all", "done", len(rubrics), len(rubrics))
 
             kinds = ["query", "rubric"] + (["building"] if buildings else [])
             done = 0
@@ -1011,12 +1196,12 @@ class DgisCrawler:
                 task = self.storage.claim_web_task(city.slug, kinds)
                 if task is None:
                     break
+                self.heartbeat()
                 try:
                     self._run_task(page, city, task, expand, max_pages)
                 except (CaptchaBlockedError, NetworkDownError) as e:
                     self.storage.finish_web_task(task["id"], "pending", error=str(e))
-                    logger.error("%s", e)
-                    break
+                    raise
                 except KeyboardInterrupt:
                     self.storage.finish_web_task(task["id"], "pending", error="прервано вручную")
                     raise
@@ -1033,10 +1218,14 @@ class DgisCrawler:
         """Выполняет задачу очереди и возвращает собранные сырые объекты."""
         kind, key, label = task["kind"], task["key"], task["label"]
         if kind == "building":
-            on_page, items, total = self.crawl_building(page, city, key)
+            on_page, items, total, collected = self.crawl_building(page, city, key)
             everything = on_page + items
             saved = self._ingest(city, everything, None, expand)
-            collected = len({str(_to_int(i.get("id"))) for i in items})
+            # на странице здания — его полная карточка: отдельно её больше не запрашиваем
+            building = next((e for e in on_page if str(_to_int(e.get("id"))) == str(key)), None)
+            card = parse_branch(building) if building and self.in_city(city, [building]) else None
+            if card:
+                self.storage.save_branches([card], full_card=True)
             status = "done" if collected >= total else "incomplete"
             self.storage.finish_web_task(task["id"], status, total=total, collected=collected)
             logger.info("[здание] %s: в здании %d/%d, сохранено %d%s",
@@ -1059,51 +1248,131 @@ class DgisCrawler:
 
     # ------------------------------------------------------------------ полные карточки
 
-    def fetch_card(self, page: Page, city: City, obj_id: int, obj_type: str
-                   ) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
+    def crawl_details(self, city: City, rows: List[Dict[str, Any]], reviews: bool = True) -> List[Dict[str, Any]]:
         """
-        Полная карточка со страницы объекта: контакты, соцсети, атрибуты — всё, что отдаёт сайт.
-        Здание с одной организацией сайт перенаправляет на карточку этой организации —
-        тогда возвращается карточка организации и её id.
+        Полная карточка и все отзывы каждого объекта. Для объекта с отзывами — один HTTP-запрос
+        страницы /tab/reviews: в ней и полная карточка (контакты, соцсети, атрибуты), и первые 50
+        отзывов; остальные отзывы и комментарии — из API отзывов, которым пользуется сам сайт
+        (по next_link), а если API не ответил — кликами «Загрузить ещё» в браузере, как раньше.
+        rows: id, type, name, review_count, card_synced_at, reviews_synced_at.
+        Возвращает разобранные карточки.
         """
-        section = "firm" if obj_type == "branch" else "geo"
-        html, final_url = self.scraper.load_html(page, f"{SITE}/{city.slug}/{section}/{obj_id}")
-        entities = state_entities(extract_initial_state(html or ""))
-        if str(obj_id) in entities:
-            return entities[str(obj_id)], obj_id
-        m = re.search(r"/(?:firm|geo)/(\d+)", final_url or "")
-        if m and m.group(1) in entities:
-            return entities[m.group(1)], int(m.group(1))
-        return None, None
-
-    def enrich_cards(self, city: City, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Открывает карточку каждого объекта и сохраняет её целиком. Возвращает разобранные карточки."""
         cards = []
         page = self.scraper.new_page()
         try:
             for idx, row in enumerate(rows, 1):
                 page = self.scraper.recycle(page)
-                entity, got_id = self.fetch_card(page, city, int(row["id"]), row["type"])
-                card = parse_branch(entity) if entity else None
-                if card is None:
-                    logger.warning("Карточка %s (%s) не получена", row["id"], row.get("name"))
-                    self.storage.mark_card_failed(int(row["id"]))
-                    self.scraper.pace()
-                    continue
-                self.storage.save_branches([card], full_card=True)
-                if got_id != int(row["id"]):
-                    # у здания нет своей карточки — сайт показывает единственную организацию в нём
-                    self.storage.mark_card_synced([int(row["id"])])
-                cards.append(card)
-                logger.info("[карточка %d/%d] %s: контактов %d, рубрик %d%s",
-                            idx, len(rows), card["name"], len(card["contacts"]), len(card["rubrics"]),
-                            "" if got_id == int(row["id"]) else f" (перенаправлено с {row['id']})")
-                self.scraper.pace()
-        except (CaptchaBlockedError, NetworkDownError) as e:
-            logger.error("%s", e)
+                self.heartbeat()
+                card = self._object_details(page, city, row, reviews, f"{idx}/{len(rows)}")
+                if card:
+                    cards.append(card)
+                self.scraper.pace(HTTP_COOLDOWN)
         finally:
             page.context.close()
         return cards
+
+    def _object_details(self, page: Page, city: City, row: Dict[str, Any], reviews: bool, progress: str
+                        ) -> Optional[Dict[str, Any]]:
+        obj_id = int(row["id"])
+        need_reviews = reviews and int(row.get("review_count") or 0) > 0 and row.get("reviews_synced_at") is None
+        section = "firm" if row.get("type", "branch") == "branch" else "geo"
+        url = f"{SITE}/{city.slug}/{section}/{obj_id}" + ("/tab/reviews" if need_reviews else "")
+        html, final_url = self.scraper.fetch_html(page, url)
+        entity, got_id = pick_entity(html, final_url, obj_id)
+        card = parse_branch(entity) if entity else None
+        if card is None:
+            logger.warning("[%s] Карточка %s (%s) не получена", progress, obj_id, row.get("name"))
+            self.storage.mark_card_failed(obj_id)
+            if need_reviews:
+                self.storage.mark_reviews_incomplete(obj_id)
+            return None
+        self.storage.save_branches([card], full_card=True)
+        if got_id != obj_id:
+            # у здания/остановки нет своей карточки — сайт показывает единственную организацию в нём
+            self.storage.mark_card_synced([obj_id])
+
+        note = ""
+        if need_reviews:
+            try:
+                got = self._reviews_via_api(page, html or "", got_id)
+                if got is None:
+                    got = self._fetch_reviews(page, f"{SITE}/{city.slug}/{section}/{got_id}/tab/reviews", got_id)
+            except (NetworkDownError, CaptchaBlockedError):
+                raise
+            except Exception as e:
+                logger.error("Отзывы %s (%s): %s — объект остаётся в очереди", obj_id, row.get("name"), e)
+                self.storage.mark_reviews_incomplete(obj_id)
+                got = None
+            if got is not None:
+                found, comments, ended = got
+                saved = self.storage.save_reviews(found)
+                self.storage.save_review_comments(comments)
+                # лента дошла до конца сама; число в карточке может включать отзывы, которых
+                # в ленте нет, поэтому сверка с ним — только «0 собрано при непустой карточке»
+                want = int(row.get("review_count") or 0)
+                complete = ended and not (saved == 0 and want > 0)
+                synced = {obj_id, got_id}
+                for bid in synced:
+                    (self.storage.mark_reviews_synced if complete else self.storage.mark_reviews_incomplete)(bid)
+                note = f", отзывов {saved} (в карточке {want}), комментариев {len(comments)}" + (
+                    "" if complete else "  НЕПОЛНО — останется в очереди")
+        logger.info("[%s] %s: контактов %d%s%s", progress, card["name"], len(card["contacts"]), note,
+                    "" if got_id == obj_id else f" (перенаправлено с {obj_id})")
+        return card
+
+    def _reviews_via_api(self, page: Page, html: str, branch_id: int
+                         ) -> Optional[Tuple[List[Dict[str, Any]], List[Dict[str, Any]], bool]]:
+        """
+        Отзывы по цепочке next_link из встроенной ленты + комментарии к ним — теми же запросами
+        к public-api.reviews.2gis.com, что делает сайт при «Загрузить ещё». None — ленты на
+        странице нет или API не ответил (тогда сбор идёт кликами в браузере).
+        """
+        feed = embedded_review_feed(html)
+        if feed is None:
+            return None
+        found: Dict[str, Dict[str, Any]] = {str(r["id"]): r for r in feed.items}
+        key = reviews_api_key(html, feed.next_link)
+        link = None
+        if feed.next_link or (feed.total or 0) > len(found):
+            # на странице не всё: полная лента с начала, включая отзывы без оценки
+            link = full_review_feed_link(feed, branch_id, key)
+            if link is None:
+                return None
+        seen_links = set()
+        while link and link not in seen_links:
+            seen_links.add(link)
+            self.scraper.pace(API_COOLDOWN)
+            data = self.scraper.fetch_json(page, link)
+            if data is None:
+                return None
+            batch = [r for r in data.get("reviews") or [] if isinstance(r, dict) and r.get("id")]
+            for r in batch:
+                found[str(r["id"])] = r
+            link = (data.get("meta") or {}).get("next_link") if batch else None
+
+        comments: List[Dict[str, Any]] = []
+        with_comments = []
+        for rid, r in found.items():
+            count = int(r.get("comments_count") or 0)
+            answer = r.get("official_answer")
+            if count == 1 and isinstance(answer, dict) and answer.get("id"):
+                # единственный комментарий — официальный ответ, он уже в отзыве (тот же id и текст):
+                # так у ~90% отзывов с комментариями, отдельный запрос не нужен
+                comments.append(parse_review_comment({
+                    **answer, "is_official_answer": True, "is_hidden": False, "org": {"name": answer.get("org_name")},
+                }, rid, branch_id))
+            elif count > 0:
+                with_comments.append(rid)
+        if with_comments and not key:
+            return None
+        for rid in with_comments:
+            self.scraper.pace(API_COOLDOWN)
+            data = self.scraper.fetch_json(page, f"{REVIEWS_API}/2.0/reviews/{rid}/comments?key={key}&locale=ru_KZ")
+            if data is None:
+                return None
+            comments.extend(parse_review_comment(c, rid, branch_id)
+                            for c in data.get("comments") or [] if isinstance(c, dict) and c.get("id"))
+        return [parse_review(r, branch_id) for r in found.values()], comments, True
 
     # ------------------------------------------------------------------ район
 
@@ -1228,7 +1497,7 @@ class DgisCrawler:
         logger.info("Скан: объектов %d, остановок %d", len(area_ids), len(stops))
 
         # полные карточки (из них же — building_id организаций)
-        cards = self.enrich_cards(city, self.storage.branches_without_card(list(area_ids)))
+        cards = self.crawl_details(city, self.storage.branches_without_card(list(area_ids)), reviews=False)
         buildings = {
             str(r["id"]) for r in self.storage.branches_by_ids(list(area_ids))
             if r["type"] == "building"
@@ -1249,8 +1518,7 @@ class DgisCrawler:
                     self._run_task(page, city, task, expand=True, max_pages=0)
                 except (CaptchaBlockedError, NetworkDownError) as e:
                     self.storage.finish_web_task(task["id"], "pending", error=str(e))
-                    logger.error("%s", e)
-                    return
+                    raise
                 except KeyboardInterrupt:
                     self.storage.finish_web_task(task["id"], "pending", error="прервано вручную")
                     raise
@@ -1264,7 +1532,7 @@ class DgisCrawler:
         area_ids |= {_to_int(b) for b in buildings}
         area_ids.discard(None)
 
-        self.enrich_cards(city, self.storage.branches_without_card(list(area_ids)))
+        self.crawl_details(city, self.storage.branches_without_card(list(area_ids)), reviews=False)
 
         rows = self.storage.branches_by_ids(list(area_ids))
         in_polygon = sum(
@@ -1283,7 +1551,7 @@ class DgisCrawler:
         if with_reviews:
             pending = [r for r in rows if (r["review_count"] or 0) > 0 and r["reviews_synced_at"] is None]
             logger.info("Объектов с несобранными отзывами: %d", len(pending))
-            self.crawl_reviews(city, pending)
+            self.crawl_details(city, pending, reviews=True)
 
     # ------------------------------------------------------------------ транспорт
 
@@ -1297,6 +1565,8 @@ class DgisCrawler:
         page = self.scraper.new_page()
         try:
             for q in queries:
+                if self.storage.web_task_done(city.slug, "transport", q):
+                    continue  # собрано прошлым запуском; маршруты и остановки ниже дособираются из БД
                 url = f"{SITE}/{city.slug}/search/{urllib.parse.quote(q)}"
                 self.storage.add_web_tasks(city.slug, "transport", [(q, q)])
                 items: List[Dict[str, Any]] = []
@@ -1357,11 +1627,12 @@ class DgisCrawler:
         try:
             for idx, route in enumerate(todo, 1):
                 page = self.scraper.recycle(page)
-                html, _ = self.scraper.load_html(page, f"{SITE}/{city.slug}/route/{route['id']}")
+                self.heartbeat()
+                html, _ = self.scraper.fetch_html(page, f"{SITE}/{city.slug}/route/{route['id']}")
                 entity = state_entities(extract_initial_state(html or "")).get(route["id"])
                 if not entity:
                     logger.warning("Маршрут %s (%s) не получен", route["id"], route.get("name"))
-                    self.scraper.pace()
+                    self.scraper.pace(HTTP_COOLDOWN)
                     continue
                 platforms, stops, links = [], {}, []
                 for d_no, direction in enumerate(entity.get("directions") or []):
@@ -1395,82 +1666,48 @@ class DgisCrawler:
                 logger.info("[маршрут %d/%d] %s %s: направлений %d, остановок %d",
                             idx, len(todo), route.get("subtype"), route.get("name"),
                             len(entity.get("directions") or []), len(platforms))
-                self.scraper.pace()
-        except (CaptchaBlockedError, NetworkDownError) as e:
-            logger.error("%s", e)
+                self.scraper.pace(HTTP_COOLDOWN)
         finally:
             page.context.close()
 
     def enrich_stops(self, city: City) -> None:
-        """Карточки остановок без адреса (встречены только на страницах маршрутов): город, район, микрорайон."""
+        """
+        Карточки остановок без адреса (встречены только на страницах маршрутов): город, район, микрорайон.
+        Станции LRT и вокзалы сайт открывает как карточку-организацию станции (другой id): такая
+        станция приходит и из поиска под id организации — две записи сливаются в одну под id
+        остановки из маршрута (по нему связь с маршрутами).
+        """
         rows = self.storage.stops_without_address(city.slug)
         logger.info("Остановок без адреса: %d — открываем их карточки", len(rows))
         page = self.scraper.new_page()
         try:
             for idx, row in enumerate(rows, 1):
                 page = self.scraper.recycle(page)
-                html, final_url = self.scraper.load_html(page, f"{SITE}/{city.slug}/geo/{row['id']}")
-                entities = state_entities(extract_initial_state(html or ""))
-                entity = entities.get(str(row["id"]))
-                if entity is None:
-                    # станции LRT и вокзалы сайт открывает как карточку-организацию станции
-                    m = re.search(r"/(?:firm|geo|station)/(\d+)", final_url or "")
-                    entity = entities.get(m.group(1)) if m else None
+                self.heartbeat()
+                html, final_url = self.scraper.fetch_html(page, f"{SITE}/{city.slug}/geo/{row['id']}")
+                entity, got_id = pick_entity(html, final_url, row["id"])
                 stop = stop_from_item(entity, city.slug, city.region, city.name) if entity else None
                 if stop:
-                    stop["id"] = str(row["id"])  # id остановки из маршрута — по нему связь с маршрутами
+                    stop["id"] = str(row["id"])
                     self.storage.save_transport_stops([stop])
+                    if got_id != int(row["id"]):
+                        self.storage.merge_stop(city.slug, keep_id=str(row["id"]), dup_id=str(got_id))
                 else:
                     logger.warning("Остановка %s (%s) не получена", row["id"], row["name"])
                 if idx % 50 == 0:
                     logger.info("[остановки] %d/%d", idx, len(rows))
-                self.scraper.pace()
-        except (CaptchaBlockedError, NetworkDownError) as e:
-            logger.error("%s", e)
+                self.scraper.pace(HTTP_COOLDOWN)
         finally:
             page.context.close()
+        merged = self.storage.merge_redirected_stops(city.slug)
+        if merged:
+            logger.info("Слито дублей станций (карточка-организация + остановка маршрута): %d", merged)
 
     # ------------------------------------------------------------------ отзывы
 
-    def crawl_reviews(self, city: City, branches: List[Dict[str, Any]]) -> int:
-        """Все отзывы объектов: вкладка отзывов + «Загрузить ещё» до конца."""
-        total_saved = 0
-        page = self.scraper.new_page()
-        try:
-            for idx, branch in enumerate(branches, 1):
-                page = self.scraper.recycle(page)
-                try:
-                    reviews, comments, ended = self._fetch_reviews(page, city, int(branch["id"]))
-                except (NetworkDownError, CaptchaBlockedError):
-                    raise
-                except Exception as e:
-                    logger.error("Отзывы %s (%s): %s — объект остаётся в очереди", branch["id"], branch.get("name"), e)
-                    self.storage.mark_reviews_incomplete(int(branch["id"]))
-                    continue
-                saved = self.storage.save_reviews(reviews)
-                self.storage.save_review_comments(comments)
-                # лента дошла до конца сама; число в карточке может включать отзывы, которых
-                # в ленте нет, поэтому сверка с ним — только «0 собрано при непустой карточке»
-                want = int(branch.get("review_count") or 0)
-                complete = ended and not (saved == 0 and want > 0)
-                if complete:
-                    self.storage.mark_reviews_synced(int(branch["id"]))
-                else:
-                    self.storage.mark_reviews_incomplete(int(branch["id"]))
-                total_saved += saved
-                logger.info("[%d/%d] %s: отзывов %d (в карточке %s), комментариев %d%s",
-                            idx, len(branches), branch.get("name"), saved, branch.get("review_count"),
-                            len(comments), "" if complete else "  НЕПОЛНО — останется в очереди")
-                self.scraper.pace()
-        except (CaptchaBlockedError, NetworkDownError) as e:
-            logger.error("%s", e)
-        finally:
-            page.context.close()
-        return total_saved
-
-    def _fetch_reviews(self, page: Page, city: City, branch_id: int
+    def _fetch_reviews(self, page: Page, url: str, branch_id: int
                        ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], bool]:
-        """Все отзывы объекта и комментарии к ним (ответы организации, реплики)."""
+        """Все отзывы объекта и комментарии к ним кликами «Загрузить ещё» в браузере (запасной путь)."""
         found: Dict[str, Dict[str, Any]] = {}
         comments: Dict[str, Tuple[str, Dict[str, Any]]] = {}
 
@@ -1494,7 +1731,7 @@ class DgisCrawler:
 
         page.on("response", on_response)
         try:
-            html = self.scraper.load_page(page, f"{SITE}/{city.slug}/firm/{branch_id}/tab/reviews")
+            html = self.scraper.load_page(page, url)
             if html is None:
                 raise RuntimeError("страница отзывов не загрузилась")
             for r in embedded_reviews(html):
@@ -1510,3 +1747,64 @@ class DgisCrawler:
             [parse_review_comment(c, rid, branch_id) for rid, c in comments.values() if rid in found],
             ended,
         )
+
+    # ------------------------------------------------------------------ очередь «город × этап» (kz)
+
+    def ensure_region(self, city: City) -> None:
+        """
+        Данные проекта 2ГИС (границы, спутники, statistics: сколько объектов, маршрутов и рубрик
+        в городе по данным 2ГИС) — в regions. По ним отчёт сверяет полноту сбора.
+        """
+        if not city.region_id or self.storage.region_fresh(int(city.region_id)):
+            return
+        page = self.scraper.new_page()
+        try:
+            html, _ = self.scraper.fetch_html(page, f"{SITE}/{city.slug}")
+        finally:
+            page.context.close()
+        profile = ((((extract_initial_state(html or "") or {}).get("data") or {}).get("region") or {})
+                   .get("profile") or {}).get(str(city.region_id))
+        data = (profile or {}).get("data")
+        if not data:
+            logger.warning("Данные проекта %s (region_id %s) не получены", city.slug, city.region_id)
+            return
+        self.storage.save_region(int(city.region_id), city.slug, data, wkt_rings(data.get("bounds") or ""))
+        stat = data.get("statistics") or {}
+        logger.info("Проект %s: объектов по данным 2ГИС %s, организаций %s, маршрутов %s, рубрик %s, спутников %d",
+                    city.name, stat.get("branch_count"), stat.get("org_count"), stat.get("route_count"),
+                    stat.get("rubric_count"), len(data.get("satellites") or []))
+
+    def run_stage(self, city: City, stage: str) -> bool:
+        """
+        Один этап обхода города. True — этап закончен (открытых задач не осталось),
+        False — остались задачи для повторной попытки (очередь kz вернётся к этапу).
+        Капча и обрыв сети пробрасываются наружу: очередь отложит этап и повторит позже.
+        """
+        self.ensure_region(city)
+        if stage == "transport":
+            self.crawl_transport(city, ("all",))
+            return True
+        if stage in ("catalog", "buildings"):
+            with_buildings = stage == "buildings"
+            self.crawl_catalog(city, buildings=with_buildings)
+            kinds = ["query", "rubric"] + (["building"] if with_buildings else [])
+            return self.storage.open_web_tasks(city.slug, kinds, MAX_TASK_ATTEMPTS) == 0
+        if stage == "details":
+            return self._details_until_done(city)
+        if stage == "recheck":
+            reset = self.storage.reset_exhausted(city.slug, int(city.region_id))
+            logger.info("Добор %s: возвращено в работу задач и объектов: %s", city.name, reset)
+            self.crawl_catalog(city, buildings=True)
+            done = self.storage.open_web_tasks(city.slug, ["query", "rubric", "building"], MAX_TASK_ATTEMPTS) == 0
+            return self._details_until_done(city) and done
+        raise ValueError(f"неизвестный этап: {stage}")
+
+    def _details_until_done(self, city: City, batch: int = 500) -> bool:
+        """Карточки и отзывы объектов города пачками: сначала сам город, потом населённые пункты-спутники."""
+        while True:
+            rows = self.storage.objects_for_details(int(city.region_id), city.name, batch)
+            if not rows:
+                return True
+            logger.info("Карточки и отзывы %s: пачка %d объектов (осталось всего %d)",
+                        city.name, len(rows), self.storage.count_objects_for_details(int(city.region_id)))
+            self.crawl_details(city, rows)

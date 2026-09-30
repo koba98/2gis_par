@@ -111,6 +111,7 @@ CREATE INDEX IF NOT EXISTS idx_branches_coords ON branches (lat, lon);
 CREATE INDEX IF NOT EXISTS idx_branches_org ON branches (org_id);
 CREATE INDEX IF NOT EXISTS idx_branches_region ON branches (region_id);
 CREATE INDEX IF NOT EXISTS idx_branches_reviews_synced ON branches (reviews_synced_at NULLS FIRST);
+CREATE INDEX IF NOT EXISTS idx_branches_building ON branches (building_id);
 
 -- Связь филиал <-> рубрика
 CREATE TABLE IF NOT EXISTS branch_rubrics (
@@ -186,7 +187,7 @@ CREATE INDEX IF NOT EXISTS idx_review_comments_review ON review_comments (review
 CREATE TABLE IF NOT EXISTS web_crawl_tasks (
     id              bigserial PRIMARY KEY,
     city_slug       text NOT NULL,
-    kind            text NOT NULL CHECK (kind IN ('query', 'rubric', 'building', 'area', 'transport')),
+    kind            text NOT NULL CHECK (kind IN ('query', 'rubric', 'building', 'area', 'transport', 'rubricator')),
     key             text NOT NULL,
     label           text,
     status          text NOT NULL DEFAULT 'pending'
@@ -205,7 +206,7 @@ CREATE TABLE IF NOT EXISTS web_crawl_tasks (
 CREATE INDEX IF NOT EXISTS idx_web_crawl_tasks_queue ON web_crawl_tasks (city_slug, status, kind, id);
 ALTER TABLE web_crawl_tasks DROP CONSTRAINT IF EXISTS web_crawl_tasks_kind_check;
 ALTER TABLE web_crawl_tasks ADD CONSTRAINT web_crawl_tasks_kind_check
-    CHECK (kind IN ('query', 'rubric', 'building', 'area', 'transport'));
+    CHECK (kind IN ('query', 'rubric', 'building', 'area', 'transport', 'rubricator'));
 
 -- Задачи зданий раньше могли ставиться с составным ключом '<id>_<хэш>': на такой
 -- странице ответ «В здании» не совпадал по building_id. Ключ приводится к числовому ID.
@@ -219,6 +220,12 @@ UPDATE web_crawl_tasks
 SET key = split_part(key, '_', 1), attempts = 0,
     status = CASE WHEN status IN ('error', 'incomplete') THEN 'pending' ELSE status END
 WHERE kind = 'building' AND key LIKE '%\_%';
+
+-- Раньше короткая страница посреди выдачи считалась концом выдачи, и задача получала done
+-- при сборе заметно меньше заявленного (например, 377 из 1468). Такие задачи — на повтор.
+UPDATE web_crawl_tasks SET status = 'incomplete', attempts = 0
+WHERE status = 'done' AND kind IN ('query', 'rubric', 'transport')
+  AND total > 0 AND collected < total * 0.95;
 
 -- Плоское представление филиалов для выгрузок и аналитики
 CREATE OR REPLACE VIEW v_branches AS
@@ -635,6 +642,86 @@ LEFT JOIN v_objects o ON o.building_id = bld.id AND o.id <> bld.id
 WHERE bld.object_type = 'building'
 GROUP BY bld.id, bld.name, bld.address, bld.locality, bld.district, bld.microdistrict,
          bld.lat, bld.lon, bld.rating, bld.review_count, bld.url_2gis;
+
+-- ============================================================================
+-- План обхода Казахстана (python main.py kz): город × этап, по волнам
+-- ============================================================================
+ALTER TABLE regions ADD COLUMN IF NOT EXISTS city_slug text;
+
+CREATE TABLE IF NOT EXISTS crawl_plan (
+    city_slug   text NOT NULL,
+    stage       text NOT NULL CHECK (stage IN ('transport', 'catalog', 'buildings', 'details', 'recheck')),
+    tier        smallint NOT NULL,
+    position    integer NOT NULL,
+    status      text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'done')),
+    worker      text,
+    attempts    integer NOT NULL DEFAULT 0,
+    last_error  text,
+    not_before  timestamptz,
+    started_at  timestamptz,
+    finished_at timestamptz,
+    updated_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (city_slug, stage)
+);
+
+-- Полнота по городам: сколько объектов, маршрутов и рубрик заявляет 2ГИС (statistics проекта) и сколько собрано
+CREATE OR REPLACE VIEW v_city_completeness AS
+WITH b AS (
+    SELECT region_id,
+           count(*) AS objects,
+           count(*) FILTER (WHERE coalesce(raw->>'type', 'branch') = 'branch') AS branches,
+           count(*) FILTER (WHERE card_synced_at IS NOT NULL) AS cards,
+           count(*) FILTER (WHERE card_synced_at IS NULL AND card_attempts >= 3) AS cards_failed,
+           count(*) FILTER (WHERE coalesce(review_count, 0) > 0) AS with_reviews,
+           count(*) FILTER (WHERE coalesce(review_count, 0) > 0 AND reviews_synced_at IS NOT NULL) AS reviews_synced,
+           count(*) FILTER (WHERE coalesce(review_count, 0) > 0 AND reviews_synced_at IS NULL
+                              AND reviews_attempts >= 3) AS reviews_failed
+    FROM branches GROUP BY region_id
+), t AS (
+    SELECT city_slug,
+           count(*) FILTER (WHERE kind = 'rubric') AS rubrics_queued,
+           count(*) FILTER (WHERE kind IN ('query', 'rubric', 'building') AND status IN ('pending', 'running')) AS tasks_open,
+           count(*) FILTER (WHERE kind IN ('query', 'rubric', 'building') AND status IN ('incomplete', 'error')) AS tasks_incomplete
+    FROM web_crawl_tasks GROUP BY city_slug
+)
+SELECT
+    r.id AS region_id,
+    r.city_slug,
+    r.name AS city,
+    (r.raw->'statistics'->>'branch_count')::int AS declared_branches,
+    coalesce(b.branches, 0) AS branches,
+    round(100.0 * coalesce(b.branches, 0) / nullif((r.raw->'statistics'->>'branch_count')::int, 0), 1) AS branches_pct,
+    coalesce(b.objects, 0) AS objects_all,
+    coalesce(b.cards, 0) AS full_cards,
+    round(100.0 * coalesce(b.cards, 0) / nullif(b.objects, 0), 1) AS cards_pct,
+    coalesce(b.cards_failed, 0) AS cards_failed,
+    coalesce(b.with_reviews, 0) AS objects_with_reviews,
+    coalesce(b.reviews_synced, 0) AS reviews_synced,
+    round(100.0 * coalesce(b.reviews_synced, 0) / nullif(b.with_reviews, 0), 1) AS reviews_pct,
+    coalesce(b.reviews_failed, 0) AS reviews_failed,
+    (r.raw->'statistics'->>'route_count')::int AS declared_routes,
+    (SELECT count(*) FROM transport_routes tr WHERE tr.city_slug = r.city_slug) AS routes,
+    (r.raw->'statistics'->>'rubric_count')::int AS declared_rubrics,
+    coalesce(t.rubrics_queued, 0) AS rubrics_queued,
+    coalesce(t.tasks_open, 0) AS tasks_open,
+    coalesce(t.tasks_incomplete, 0) AS tasks_incomplete
+FROM regions r
+LEFT JOIN b ON b.region_id = r.id
+LEFT JOIN t ON t.city_slug = r.city_slug
+WHERE r.city_slug IS NOT NULL;
+
+COMMENT ON TABLE crawl_plan IS 'План обхода Казахстана (команда kz): этапы каждого города по волнам — 1 крупные города, 2 областные центры, 3 малые города, 4 добор';
+COMMENT ON COLUMN crawl_plan.city_slug IS 'Город (slug на 2gis.kz)';
+COMMENT ON COLUMN crawl_plan.stage IS 'Этап: transport, catalog (рубрики и запросы), buildings («В здании»), details (карточки и отзывы), recheck (добор неполного)';
+COMMENT ON COLUMN crawl_plan.tier IS 'Волна: 1 крупные города, 2 областные центры, 3 малые города, 4 добор';
+COMMENT ON COLUMN crawl_plan.position IS 'Порядок выполнения; этап города начинается после всех предыдущих этапов этого города';
+COMMENT ON COLUMN crawl_plan.status IS 'pending — ждёт, running — выполняется воркером, done — выполнен';
+COMMENT ON COLUMN crawl_plan.worker IS 'Какой воркер выполняет этап';
+COMMENT ON COLUMN crawl_plan.attempts IS 'Сколько раз этап брался в работу';
+COMMENT ON COLUMN crawl_plan.last_error IS 'Последняя причина остановки (капча, сеть, ошибка)';
+COMMENT ON COLUMN crawl_plan.not_before IS 'Этап отложен до этого времени (после капчи или обрыва сети)';
+COMMENT ON COLUMN regions.city_slug IS 'Город на 2gis.kz (slug), к которому относится проект';
+COMMENT ON VIEW v_city_completeness IS 'Полнота по городам: заявлено 2ГИС (объекты, маршруты, рубрики) и собрано; доля полных карточек и собранных лент отзывов; открытые и неполные задачи';
 
 -- ============================================================================
 -- Описания (комментарии) таблиц и колонок на русском языке
