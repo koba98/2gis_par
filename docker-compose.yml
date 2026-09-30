@@ -1,15 +1,33 @@
-# Запуск на сервере: docker compose run --rm parser <команда> ...
-# Например: docker compose run --rm parser catalog -r Астана
+# Запуск на сервере.
+#   Весь Казахстан по волнам (воркер работает сам, после капчи/обрыва сети ждёт и продолжает):
+#     docker compose up -d kz            # логи: docker compose logs -f kz
+#     docker compose run --rm parser plan    # что уже выполнено
+#     docker compose run --rm parser stats   # полнота: заявлено 2ГИС / собрано по городам
+#   Разовая команда:  docker compose run --rm parser catalog -r Астана
+# Второй воркер имеет смысл только с другим IP: раскомментируйте kz2 и задайте DGIS_PROXY_2 в .env.
 # Лимиты подобраны по замерам: один воркер = Python ~20 МБ + Chrome до ~1,5 ГБ
-# (контекст браузера пересоздаётся каждые 150 страниц, память не копится).
+# (контекст браузера пересоздаётся каждые 40 страниц, память не копится).
+x-parser: &parser
+  build: .
+  env_file: .env                  # PG_DSN, PG_SCHEMA, DGIS_PACE, DGIS_PROXY
+  network_mode: host              # доступ к PostgreSQL на хосте по localhost
+  shm_size: "512m"                # Chrome использует /dev/shm
+  mem_limit: "2g"                 # жёсткий потолок памяти на один воркер
+  cpus: "1.5"
+  volumes:
+    - ./output:/app/output        # CSV и кэш сканов районов
+
 services:
   parser:
-    build: .
-    env_file: .env                  # PG_DSN, PG_SCHEMA
-    network_mode: host              # доступ к PostgreSQL на хосте по localhost
-    shm_size: "512m"                # Chrome использует /dev/shm
-    mem_limit: "2g"                 # жёсткий потолок памяти на один воркер
-    cpus: "1.5"
-    volumes:
-      - ./output:/app/output        # CSV и кэш сканов районов
+    <<: *parser
     restart: "no"
+
+  kz:
+    <<: *parser
+    command: ["kz", "--captcha-wait", "0", "--worker", "kz-1"]
+    restart: unless-stopped
+
+  # kz2:
+  #   <<: *parser
+  #   command: ["kz", "--captcha-wait", "0", "--worker", "kz-2", "--proxy", "${DGIS_PROXY_2}"]
+  #   restart: unless-stopped
