@@ -25,7 +25,7 @@ import random
 import re
 import time
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -63,13 +63,18 @@ SCAN_RECT = (440, 90, 1330, 780)   # часть экрана без панеле
 SCAN_STEP_PX = 32                  # шаг сетки ≈ 12 м: мельче большинства зданий и площадок
 SCAN_CLICK_PAUSE = (0.25, 0.5)
 
-# Экономия ресурсов: не грузим то, что не несёт данных (картинки, шрифты, медиа,
-# счётчики аналитики), тайлы карты — только в режиме скана района
-BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
-_TRACKERS = (r"mc\.yandex\.|mail\.ru|google-analytics|analytics\.google|googletagmanager|doubleclick"
-             r"|tns-counter|yadro\.ru|google\.[a-z.]+/(?:ads|pagead)|www\.google\.kz|facebook\.|vk\.com/rtrg")
-TRACKER_HOSTS = re.compile(_TRACKERS)
-TRACKER_AND_MAP_HOSTS = re.compile(_TRACKERS + r"|tile\d*\.maps\.2gis\.|jam\.api\.2gis\.|mapgl\.2gis\.com")
+# Экономия ресурсов: не грузим то, что не несёт данных (картинки, шрифты, медиа, счётчики
+# аналитики), тайлы карты — только в режиме скана района. Блокирует сам Chrome (флаг и
+# CDP Network.setBlockedURLs), а не context.route: через route каждый запрос шёл в Python,
+# и в одностраничном сайте объекты Request/Route копились до закрытия контекста
+# (443 + 443 за 36 страниц выдачи — основная часть роста памяти Python).
+BLOCKED_URLS = [
+    "*mc.yandex.*", "*.mail.ru/*", "*google-analytics.*", "*analytics.google.*", "*googletagmanager.*",
+    "*doubleclick.*", "*tns-counter.*", "*yadro.ru*", "*google.*/ads*", "*google.*/pagead*", "*www.google.kz*",
+    "*facebook.*", "*vk.com/rtrg*",
+    "*.woff", "*.woff2", "*.ttf", "*.otf", "*.mp4", "*.webm", "*.mp3",
+]
+BLOCKED_MAP_URLS = ["*tile*.maps.2gis.*", "*jam.api.2gis.*", "*mapgl.2gis.com*"]
 RECYCLE_EVERY = 40             # пересоздавать контекст каждые N загрузок: рендерер 2ГИС копит ~20 МБ на страницу
 RECYCLE_REQUESTS_EVERY = 300   # и каждые N HTTP-запросов: Playwright держит объекты ответов до закрытия контекста
 CHROME_ARGS = [
@@ -694,7 +699,8 @@ class DgisBrowserScraper:
 
     def __enter__(self):
         self._pw = sync_playwright().start()
-        args = CHROME_ARGS if self.map_mode else CHROME_ARGS + ["--disable-gpu"]
+        # без карты: ни GPU, ни картинок (картинки не запрашиваются вовсе)
+        args = CHROME_ARGS if self.map_mode else CHROME_ARGS + ["--disable-gpu", "--blink-settings=imagesEnabled=false"]
         launch_kwargs: Dict[str, Any] = {"headless": self.headless, "args": args}
         if self.channel and self.channel != "chromium":
             launch_kwargs["channel"] = self.channel
@@ -720,17 +726,11 @@ class DgisBrowserScraper:
             kwargs["proxy"] = {"server": self.proxies[self._proxy_idx % len(self.proxies)]}
             self._proxy_idx += 1
         context = self._browser.new_context(**kwargs)
-        blocked_hosts = TRACKER_HOSTS if with_map else TRACKER_AND_MAP_HOSTS
-
-        def route(r) -> None:
-            req = r.request
-            if blocked_hosts.search(req.url) or (not with_map and req.resource_type in BLOCKED_RESOURCE_TYPES):
-                r.abort()
-            else:
-                r.continue_()
-
-        context.route("**/*", route)
         page = context.new_page()
+        cdp = context.new_cdp_session(page)
+        cdp.send("Network.enable")
+        cdp.send("Network.setBlockedURLs",
+                 {"urls": BLOCKED_URLS + ([] if with_map else BLOCKED_MAP_URLS)})
         page._dgis_with_map = with_map  # для пересоздания с теми же настройками
         return page
 
@@ -886,6 +886,7 @@ class SearchRun:
     pages_done: int
 
     ended: bool = False  # выдача кончилась раньше заявленного числа страниц
+    ids: set = field(default_factory=set)  # id всех полученных объектов (items пуст, если они ушли в on_items)
 
     @property
     def complete(self) -> bool:
@@ -893,7 +894,7 @@ class SearchRun:
 
     @property
     def unique(self) -> int:
-        return len({str(i.get("id")) for i in self.items})
+        return len(self.ids | {str(i.get("id")) for i in self.items})
 
 
 def _items_listener(sink: Callable[[Dict[str, List[str]], Dict[str, Any]], None]) -> Callable[[Response], None]:
@@ -948,22 +949,36 @@ class DgisCrawler:
     # ------------------------------------------------------------------ поисковая выдача
 
     def paginate_search(self, page: Page, url: str, max_pages: int,
-                        heartbeat: Optional[Callable[[], None]] = None) -> SearchRun:
+                        heartbeat: Optional[Callable[[], None]] = None,
+                        on_items: Optional[Callable[[List[Dict[str, Any]]], None]] = None) -> SearchRun:
         """
         Проходит все страницы выдачи кликами. Страница 1 — из initialState,
         остальные — из XHR /3.0/items, который сайт запрашивает при клике.
         Выдача в одну страницу (мелкие рубрики, малые города) берётся HTTP-запросом без рендера.
+        on_items — получать объекты постранично (сразу в БД), не копя их в памяти: на выдаче
+        в 389 страниц накопленные объекты занимали ~450 МБ.
         """
+        ids: set = set()
+        kept: List[Dict[str, Any]] = []
+
+        def take(batch: List[Dict[str, Any]]) -> None:
+            ids.update(str(i.get("id")) for i in batch)
+            if on_items:
+                on_items(batch)
+            else:
+                kept.extend(batch)
+
         html, _ = self.scraper.fetch_html(page, url)
         state = extract_initial_state(html or "")
         if state is not None:
             entities = state_entities(state)
             total, pages, first_ids = search_meta(state)
             if total is None:
-                items = list(entities.values())  # запрос открыл одну карточку напрямую
-                return SearchRun(items, len(items), 1, 1)
+                take(list(entities.values()))  # запрос открыл одну карточку напрямую
+                return SearchRun(kept, len(ids), 1, 1, ids=ids)
             if (pages or 1) <= 1:
-                return SearchRun([entities[i] for i in first_ids if i in entities], total, 1, 1)
+                take([entities[i] for i in first_ids if i in entities])
+                return SearchRun(kept, total, 1, 1, ids=ids)
         self.scraper.pace(HTTP_COOLDOWN)
 
         by_page: Dict[int, List[Dict[str, Any]]] = {}
@@ -989,9 +1004,10 @@ class DgisCrawler:
             total, pages, first_ids = search_meta(state)
             if total is None:
                 # запрос открыл одну карточку напрямую (точное совпадение)
-                items = list(entities.values())
-                return SearchRun(items, len(items), 1, 1)
+                take(list(entities.values()))
+                return SearchRun(kept, len(ids), 1, 1, ids=ids)
             items = [entities[i] for i in first_ids if i in entities]
+            take(items)
             pages_total = max(1, pages or 1)
             pages_done = 1
             last_len = len(items)
@@ -999,25 +1015,24 @@ class DgisCrawler:
                 self.scraper.pace()
                 got = self._click_page(page, page_no, by_page)
                 if got is None:
-                    unique = len({str(i.get("id")) for i in items})
-                    if last_len < SEARCH_PAGE_SIZE and unique >= (total or 0) * 0.95:
+                    if last_len < SEARCH_PAGE_SIZE and len(ids) >= (total or 0) * 0.95:
                         # неполная предыдущая страница, дальше ссылок нет и собрано почти всё
                         # заявленное — выдача кончилась (счётчик 2ГИС бывает чуть завышен).
                         # Короткая страница посреди выдачи — это сбой, а не конец: задача останется
                         # неполной и повторится (раньше так «остановка троллейбуса» дала done при 377 из 1468).
                         logger.info("Выдача закончилась на стр. %d (2ГИС заявлял %d): %s",
                                     page_no - 1, pages_total, url)
-                        return SearchRun(items, total, pages_total, pages_done, ended=True)
+                        return SearchRun(kept, total, pages_total, pages_done, ended=True, ids=ids)
                     logger.warning("Страница %d/%d не получена (%s)", page_no, pages_total, url)
                     break
-                items.extend(got)
+                take(got)
                 last_len = len(got)
                 pages_done = page_no
                 if page_no % 20 == 0:
                     if heartbeat:
                         heartbeat()
                     self.heartbeat()
-            return SearchRun(items, total, pages_total, pages_done)
+            return SearchRun(kept, total, pages_total, pages_done, ids=ids)
         finally:
             page.remove_listener("response", listener)
 
@@ -1034,7 +1049,7 @@ class DgisCrawler:
                 logger.debug("Клик по странице %d не удался: %s", page_no, e)
                 continue
             if _wait_for(page, lambda: page_no in by_page, XHR_WAIT_SEC):
-                return by_page[page_no]
+                return by_page.pop(page_no)  # не копить ответы всех страниц в памяти
         if _looks_like_captcha(page.content()):
             self.scraper._wait_captcha(page, page.url)
         return None
@@ -1230,7 +1245,7 @@ class DgisCrawler:
 
     def _run_task(self, page: Page, city: City, task: Dict[str, Any], expand: bool, max_pages: int
                   ) -> List[Dict[str, Any]]:
-        """Выполняет задачу очереди и возвращает собранные сырые объекты."""
+        """Выполняет задачу очереди. Объекты выдачи сохраняются постранично; для здания возвращает всё найденное."""
         kind, key, label = task["kind"], task["key"], task["label"]
         if kind == "building":
             on_page, items, total, collected = self.crawl_building(page, city, key)
@@ -1251,8 +1266,14 @@ class DgisCrawler:
             url = f"{SITE}/{city.slug}/search/{urllib.parse.quote(label or 'рубрика', safe='')}/rubricId/{key}"
         else:
             url = f"{SITE}/{city.slug}/search/{urllib.parse.quote(key, safe='')}"
-        run = self.paginate_search(page, url, max_pages, heartbeat=lambda: self.storage.touch_web_task(task["id"]))
-        saved = self._ingest(city, run.items, label if kind == "rubric" else key, expand)
+        saved = [0]
+
+        def ingest_page(batch: List[Dict[str, Any]]) -> None:
+            saved[0] += self._ingest(city, batch, label if kind == "rubric" else key, expand)
+
+        run = self.paginate_search(page, url, max_pages, heartbeat=lambda: self.storage.touch_web_task(task["id"]),
+                                   on_items=ingest_page)
+        saved = saved[0]
         status = "done" if run.complete else "incomplete"
         self.storage.finish_web_task(task["id"], status, total=run.total, collected=run.unique,
                                      pages_total=run.pages_total, pages_done=run.pages_done)
