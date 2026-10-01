@@ -277,6 +277,12 @@ def main() -> None:
         handlers=[logging.StreamHandler(sys.stdout)],
     )
 
+    if sys.version_info >= (3, 14) and args.command not in ("init-db", "stats", "plan"):
+        # проверено: на 3.14 синхронный Playwright держит завершённые задачи вместе с результатами
+        # (HTML каждой страницы), память процесса растёт на ~45 МБ в минуту; на 3.12 (Docker) — нет
+        logger.warning("Python %d.%d: для долгих прогонов используйте Python 3.12 (Docker-образ) — "
+                       "на 3.14 память процесса растёт без ограничений", *sys.version_info[:2])
+
     storage = SyncStorage(dsn=args.dsn, schema=args.schema)
     if not storage.is_configured:
         raise SystemExit("Не задан PG_DSN (в .env или --dsn).")

@@ -7,6 +7,7 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
+# wget не удалять: от него зависит пакет google-chrome-stable (purge wget удалял и сам Chrome)
 RUN apt-get update \
  && apt-get install -y --no-install-recommends wget gnupg ca-certificates xvfb xauth fonts-dejavu-core \
  && wget -qO- https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google.gpg \
@@ -14,7 +15,7 @@ RUN apt-get update \
     > /etc/apt/sources.list.d/google-chrome.list \
  && apt-get update \
  && apt-get install -y --no-install-recommends google-chrome-stable \
- && apt-get purge -y wget gnupg && apt-get autoremove -y \
+ && test -x /opt/google/chrome/chrome \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -23,6 +24,11 @@ RUN pip install -r requirements.txt
 COPY *.py ./
 COPY sql ./sql
 
-# xvfb-run поднимает виртуальный дисплей на время работы команды
-ENTRYPOINT ["xvfb-run", "--auto-servernum", "--server-args=-screen 0 1920x1080x24", "python", "main.py"]
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN tr -d '\r' < /usr/local/bin/docker-entrypoint.sh > /tmp/ep \
+ && mv /tmp/ep /usr/local/bin/docker-entrypoint.sh \
+ && chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# виртуальный дисплей Xvfb + python main.py <команда>
+ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["stats"]

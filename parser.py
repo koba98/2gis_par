@@ -71,6 +71,7 @@ _TRACKERS = (r"mc\.yandex\.|mail\.ru|google-analytics|analytics\.google|googleta
 TRACKER_HOSTS = re.compile(_TRACKERS)
 TRACKER_AND_MAP_HOSTS = re.compile(_TRACKERS + r"|tile\d*\.maps\.2gis\.|jam\.api\.2gis\.|mapgl\.2gis\.com")
 RECYCLE_EVERY = 40             # пересоздавать контекст каждые N загрузок: рендерер 2ГИС копит ~20 МБ на страницу
+RECYCLE_REQUESTS_EVERY = 300   # и каждые N HTTP-запросов: Playwright держит объекты ответов до закрытия контекста
 CHROME_ARGS = [
     "--disable-dev-shm-usage",           # в Docker /dev/shm маленький
     "--disable-extensions",
@@ -687,6 +688,7 @@ class DgisBrowserScraper:
         self._proxy_idx = 0
         self._actions = 0
         self._loads: Dict[int, int] = {}
+        self._requests: Dict[int, int] = {}
         self._pw = None
         self._browser = None
 
@@ -733,10 +735,15 @@ class DgisBrowserScraper:
         return page
 
     def recycle(self, page: Page) -> Page:
-        """Каждые RECYCLE_EVERY загрузок пересоздаёт контекст: Chrome копит память (кэш SPA и карты)."""
-        if self._loads.get(id(page), 0) < RECYCLE_EVERY:
+        """
+        Пересоздаёт контекст каждые RECYCLE_EVERY загрузок страниц (Chrome копит кэш SPA и карты)
+        или RECYCLE_REQUESTS_EVERY HTTP-запросов (Playwright держит их объекты до закрытия контекста).
+        """
+        if (self._loads.get(id(page), 0) < RECYCLE_EVERY
+                and self._requests.get(id(page), 0) < RECYCLE_REQUESTS_EVERY):
             return page
         self._loads.pop(id(page), None)
+        self._requests.pop(id(page), None)
         viewport = page.viewport_size
         with_map = getattr(page, "_dgis_with_map", False)
         page.context.close()
@@ -807,9 +814,13 @@ class DgisBrowserScraper:
         Возвращает (HTML, итоговый URL после редиректов).
         """
         for attempt in range(2):
+            self._requests[id(page)] = self._requests.get(id(page), 0) + 1
             try:
                 resp = page.context.request.get(url, timeout=30000)
-                html = resp.text()
+                try:
+                    html = resp.text()
+                finally:
+                    resp.dispose()  # иначе тело ответа (~600 КБ HTML) лежит в памяти до закрытия контекста
             except Exception as e:
                 logger.debug("HTTP %s: %s (попытка %d)", url, e, attempt + 1)
                 if NETWORK_ERROR.search(str(e)):
@@ -828,10 +839,14 @@ class DgisBrowserScraper:
     def fetch_json(self, page: Page, url: str) -> Optional[Dict[str, Any]]:
         """JSON из API, к которому обращается сам сайт (лента отзывов), с заголовками сайта. None — не удалось."""
         for attempt in range(3):
+            self._requests[id(page)] = self._requests.get(id(page), 0) + 1
             try:
                 resp = page.context.request.get(url, headers={"Referer": f"{SITE}/", "Origin": SITE}, timeout=30000)
-                if resp.status == 200:
-                    return resp.json()
+                try:
+                    if resp.status == 200:
+                        return resp.json()
+                finally:
+                    resp.dispose()
                 logger.debug("API %s: статус %s", url, resp.status)
                 if resp.status != 429:
                     return None
@@ -1233,9 +1248,9 @@ class DgisCrawler:
             return everything
 
         if kind == "rubric":
-            url = f"{SITE}/{city.slug}/search/{urllib.parse.quote(label or 'рубрика')}/rubricId/{key}"
+            url = f"{SITE}/{city.slug}/search/{urllib.parse.quote(label or 'рубрика', safe='')}/rubricId/{key}"
         else:
-            url = f"{SITE}/{city.slug}/search/{urllib.parse.quote(key)}"
+            url = f"{SITE}/{city.slug}/search/{urllib.parse.quote(key, safe='')}"
         run = self.paginate_search(page, url, max_pages, heartbeat=lambda: self.storage.touch_web_task(task["id"]))
         saved = self._ingest(city, run.items, label if kind == "rubric" else key, expand)
         status = "done" if run.complete else "incomplete"
@@ -1380,7 +1395,7 @@ class DgisCrawler:
         """Район/микрорайон/жилмассив по ID или названию: полигон и число зданий по данным 2ГИС."""
         area_id = ref if ref.isdigit() else None
         if area_id is None:
-            html = self.scraper.load_page(page, f"{SITE}/{city.slug}/search/{urllib.parse.quote(ref)}")
+            html = self.scraper.load_page(page, f"{SITE}/{city.slug}/search/{urllib.parse.quote(ref, safe='')}")
             candidates = [
                 (k, d) for k, d in state_entities(extract_initial_state(html or "")).items()
                 if d.get("type") == "adm_div" and d.get("subtype") not in SKIP_ADM_SUBTYPES - {"district"}
@@ -1567,7 +1582,7 @@ class DgisCrawler:
             for q in queries:
                 if self.storage.web_task_done(city.slug, "transport", q):
                     continue  # собрано прошлым запуском; маршруты и остановки ниже дособираются из БД
-                url = f"{SITE}/{city.slug}/search/{urllib.parse.quote(q)}"
+                url = f"{SITE}/{city.slug}/search/{urllib.parse.quote(q, safe='')}"
                 self.storage.add_web_tasks(city.slug, "transport", [(q, q)])
                 items: List[Dict[str, Any]] = []
                 for attempt in range(1, MAX_TASK_ATTEMPTS + 1):
