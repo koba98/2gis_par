@@ -854,11 +854,13 @@ class SyncStorage:
                 rows,
             )
 
-    def claim_plan_job(self, tiers: Sequence[int], worker: str, stale_minutes: int = 45) -> Optional[Dict[str, Any]]:
+    def claim_plan_job(self, tiers: Sequence[int], worker: str, stale_minutes: int = 45,
+                       stages: Optional[Sequence[str]] = None) -> Optional[Dict[str, Any]]:
         """
         Следующий этап по порядку плана. Этап города берётся, только когда все предыдущие этапы
         этого города выполнены; этапы, «зависшие» у упавшего воркера, возвращаются в работу.
         Несколько воркеров (с разными IP) берут разные этапы — FOR UPDATE SKIP LOCKED.
+        stages — только эти этапы (браузерный воркер и HTTP-воркер работают конвейером).
         """
         if not self.connect():
             return None
@@ -877,6 +879,7 @@ class SyncStorage:
                 WHERE (city_slug, stage) = (
                     SELECT p.city_slug, p.stage FROM crawl_plan p
                     WHERE p.status = 'pending' AND p.tier = ANY(%(tiers)s)
+                      AND (%(stages)s::text[] IS NULL OR p.stage = ANY(%(stages)s::text[]))
                       AND (p.not_before IS NULL OR p.not_before <= now())
                       AND NOT EXISTS (
                           SELECT 1 FROM crawl_plan q
@@ -886,7 +889,7 @@ class SyncStorage:
                 )
                 RETURNING city_slug, stage, tier, attempts
                 """,
-                {"tiers": list(tiers), "worker": worker},
+                {"tiers": list(tiers), "worker": worker, "stages": list(stages) if stages else None},
             ).fetchone()
 
     def finish_plan_job(self, city_slug: str, stage: str, status: str, error: Optional[str] = None,

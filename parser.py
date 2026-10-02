@@ -29,8 +29,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+
 from playwright.sync_api import Page, Response, sync_playwright
 
+from fetcher import Blocked, HttpFetcher, looks_like_captcha
 from storage import SyncStorage
 
 logger = logging.getLogger("dgis_parser")
@@ -43,8 +46,6 @@ SITE = "https://2gis.kz"
 
 COOLDOWN = (1.5, 2.6)          # пауза после загрузки страницы / клика по пагинации
 SHORT_COOLDOWN = (0.6, 1.2)    # пауза между «Загрузить ещё»
-HTTP_COOLDOWN = (0.8, 1.6)     # пауза после HTTP-запроса HTML: один запрос вместо страницы с десятками XHR
-API_COOLDOWN = (0.25, 0.6)     # пауза между запросами ленты отзывов и комментариев
 LOAD_MORE = re.compile("Загрузить ещё|Показать ещё")
 LONG_BREAK_EVERY = 150         # каждые N действий — длинный перерыв
 LONG_BREAK = (25.0, 50.0)
@@ -76,7 +77,6 @@ BLOCKED_URLS = [
 ]
 BLOCKED_MAP_URLS = ["*tile*.maps.2gis.*", "*jam.api.2gis.*", "*mapgl.2gis.com*"]
 RECYCLE_EVERY = 40             # пересоздавать контекст каждые N загрузок: рендерер 2ГИС копит ~20 МБ на страницу
-RECYCLE_REQUESTS_EVERY = 300   # и каждые N HTTP-запросов: Playwright держит объекты ответов до закрытия контекста
 CHROME_ARGS = [
     "--disable-dev-shm-usage",           # в Docker /dev/shm маленький
     "--disable-extensions",
@@ -671,19 +671,20 @@ class NetworkDownError(RuntimeError):
     """Сети нет дольше NET_WAIT_MAX_SEC — обход останавливается, прогресс сохранён."""
 
 
-def _looks_like_captcha(html: str) -> bool:
-    return "g-recaptcha" in html or "2GIS Captcha" in html
+_looks_like_captcha = looks_like_captcha
 
 
 class DgisBrowserScraper:
     """
-    Системный Chrome через Playwright. По умолчанию окно видимое: 2ГИС отдаёт
-    капчу headless-браузерам и дата-центровым IP.
+    Системный Chrome через Playwright + HTTP-клиент без браузера (self.http).
+    Chrome запускается лениво — при первой загрузке, которой нужен браузер: этапы, где хватает
+    HTTP (карточки, отзывы, здания, маршруты), могут пройти вовсе без него.
+    По умолчанию окно видимое: 2ГИС отдаёт капчу headless-браузерам и дата-центровым IP.
     """
 
     def __init__(self, headless: bool = False, channel: Optional[str] = "chrome",
                  proxies: Optional[List[str]] = None, map_mode: bool = False,
-                 pace_factor: float = 1.0, captcha_wait: int = CAPTCHA_WAIT_SEC):
+                 pace_factor: float = 1.0, captcha_wait: int = CAPTCHA_WAIT_SEC, concurrency: int = 3):
         self.headless = headless
         self.channel = channel
         self.map_mode = map_mode  # скан карты района требует WebGL; остальным режимам GPU не нужен
@@ -693,11 +694,17 @@ class DgisBrowserScraper:
         self._proxy_idx = 0
         self._actions = 0
         self._loads: Dict[int, int] = {}
-        self._requests: Dict[int, int] = {}
         self._pw = None
         self._browser = None
+        self._page: Optional[Page] = None  # общая страница для кликов и запасного пути
+        self.http = HttpFetcher(self.proxies, pace_factor, concurrency)
 
     def __enter__(self):
+        return self
+
+    def _ensure_browser(self) -> None:
+        if self._browser is not None:
+            return
         self._pw = sync_playwright().start()
         # без карты: ни GPU, ни картинок (картинки не запрашиваются вовсе)
         args = CHROME_ARGS if self.map_mode else CHROME_ARGS + ["--disable-gpu", "--blink-settings=imagesEnabled=false"]
@@ -707,9 +714,9 @@ class DgisBrowserScraper:
         self._browser = self._pw.chromium.launch(**launch_kwargs)
         logger.info("Браузер запущен (headless=%s, channel=%s, прокси: %d)",
                     self.headless, self.channel, len(self.proxies))
-        return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        self.http.close()
         if self._browser:
             self._browser.close()
         if self._pw:
@@ -721,6 +728,7 @@ class DgisBrowserScraper:
         Трекеры, картинки, шрифты и медиа не грузятся; тайлы карты — только при with_map
         (нужны для скана района). Данные 2ГИС (HTML, XHR каталога и отзывов) не трогаются.
         """
+        self._ensure_browser()
         kwargs: Dict[str, Any] = {"viewport": viewport or random.choice(VIEWPORTS), "locale": "ru-RU"}
         if self.proxies:
             kwargs["proxy"] = {"server": self.proxies[self._proxy_idx % len(self.proxies)]}
@@ -734,16 +742,16 @@ class DgisBrowserScraper:
         page._dgis_with_map = with_map  # для пересоздания с теми же настройками
         return page
 
+    def browser_page(self) -> Page:
+        """Общая страница браузера (запускает Chrome при первом вызове), пересоздаётся каждые RECYCLE_EVERY загрузок."""
+        self._page = self.recycle(self._page) if self._page is not None else self.new_page()
+        return self._page
+
     def recycle(self, page: Page) -> Page:
-        """
-        Пересоздаёт контекст каждые RECYCLE_EVERY загрузок страниц (Chrome копит кэш SPA и карты)
-        или RECYCLE_REQUESTS_EVERY HTTP-запросов (Playwright держит их объекты до закрытия контекста).
-        """
-        if (self._loads.get(id(page), 0) < RECYCLE_EVERY
-                and self._requests.get(id(page), 0) < RECYCLE_REQUESTS_EVERY):
+        """Пересоздаёт контекст каждые RECYCLE_EVERY загрузок страниц: Chrome копит кэш SPA и карты."""
+        if self._loads.get(id(page), 0) < RECYCLE_EVERY:
             return page
         self._loads.pop(id(page), None)
-        self._requests.pop(id(page), None)
         viewport = page.viewport_size
         with_map = getattr(page, "_dgis_with_map", False)
         page.context.close()
@@ -805,56 +813,23 @@ class DgisBrowserScraper:
         html = self.load_page(page, url)
         return html, page.url
 
-    def fetch_html(self, page: Page, url: str) -> Tuple[Optional[str], str]:
+    def fetch_html(self, page: Optional[Page], url: str) -> Tuple[Optional[str], str]:
         """
-        HTML страницы обычным HTTP-запросом из контекста браузера (те же куки и прокси).
-        Сервер 2ГИС отдаёт initialState уже в HTML, поэтому рендер не нужен: ~0,5 с вместо
-        загрузки страницы с десятками XHR. Капча, заглушка «обновите браузер», блокировка
-        или сбой — страница открывается в браузере (load_page: ожидание капчи и сети).
-        Возвращает (HTML, итоговый URL после редиректов).
+        HTML страницы: сначала HTTP-запросом без браузера (self.http, ~0,5 с), а если вместо данных
+        пришли капча, заглушка или сбой — загрузкой в браузере (load_page: ожидание капчи и сети).
+        page — страница для запасного пути (по умолчанию общая). Возвращает (HTML, итоговый URL).
         """
-        for attempt in range(2):
-            self._requests[id(page)] = self._requests.get(id(page), 0) + 1
-            try:
-                resp = page.context.request.get(url, timeout=30000)
-                try:
-                    html = resp.text()
-                finally:
-                    resp.dispose()  # иначе тело ответа (~600 КБ HTML) лежит в памяти до закрытия контекста
-            except Exception as e:
-                logger.debug("HTTP %s: %s (попытка %d)", url, e, attempt + 1)
-                if NETWORK_ERROR.search(str(e)):
-                    break  # ожидание сети — в load_page
-                _pause(COOLDOWN)
-                continue
-            if resp.status == 404:
-                return html, resp.url  # объекта больше нет
-            if resp.status == 200 and "var initialState" in html and not _looks_like_captcha(html):
-                return html, resp.url
-            logger.debug("HTTP %s: статус %s, капча %s — открываем в браузере", url, resp.status,
-                         _looks_like_captcha(html))
-            break
-        return self.load_html(page, url)
+        try:
+            html, final_url = self.http.get_html(url)
+            if html is not None:
+                return html, final_url
+        except Blocked:
+            pass  # в браузере капчу видно: её решит человек или этап отложится
+        return self.load_html(page or self.browser_page(), url)
 
-    def fetch_json(self, page: Page, url: str) -> Optional[Dict[str, Any]]:
-        """JSON из API, к которому обращается сам сайт (лента отзывов), с заголовками сайта. None — не удалось."""
-        for attempt in range(3):
-            self._requests[id(page)] = self._requests.get(id(page), 0) + 1
-            try:
-                resp = page.context.request.get(url, headers={"Referer": f"{SITE}/", "Origin": SITE}, timeout=30000)
-                try:
-                    if resp.status == 200:
-                        return resp.json()
-                finally:
-                    resp.dispose()
-                logger.debug("API %s: статус %s", url, resp.status)
-                if resp.status != 429:
-                    return None
-                time.sleep(random.uniform(20, 40) * self.pace_factor)  # 429 — слишком часто, ждём
-            except Exception as e:
-                logger.debug("API %s: %s (попытка %d)", url, e, attempt + 1)
-                _pause(COOLDOWN)
-        return None
+    def fetch_json(self, page: Optional[Page], url: str) -> Optional[Dict[str, Any]]:
+        """JSON из API, к которому обращается сам сайт (лента отзывов), — HTTP без браузера. None — не удалось."""
+        return self.http.get_json(url)
 
     def _wait_captcha(self, page: Page, url: str) -> str:
         if self.captcha_wait <= 0:
@@ -948,7 +923,7 @@ class DgisCrawler:
 
     # ------------------------------------------------------------------ поисковая выдача
 
-    def paginate_search(self, page: Page, url: str, max_pages: int,
+    def paginate_search(self, page: Optional[Page], url: str, max_pages: int,
                         heartbeat: Optional[Callable[[], None]] = None,
                         on_items: Optional[Callable[[List[Dict[str, Any]]], None]] = None) -> SearchRun:
         """
@@ -979,7 +954,7 @@ class DgisCrawler:
             if (pages or 1) <= 1:
                 take([entities[i] for i in first_ids if i in entities])
                 return SearchRun(kept, total, 1, 1, ids=ids)
-        self.scraper.pace(HTTP_COOLDOWN)
+        page = page or self.scraper.browser_page()
 
         by_page: Dict[int, List[Dict[str, Any]]] = {}
 
@@ -1056,7 +1031,8 @@ class DgisCrawler:
 
     # ------------------------------------------------------------------ здание / ЖК
 
-    def crawl_building(self, page: Page, city: City, building_id: str
+    def crawl_building(self, page: Optional[Page], city: City, building_id: str,
+                       prefetched: Optional[Tuple[Optional[str], str]] = None
                        ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int, int]:
         """
         Карточка здания + всё, что 2ГИС показывает на вкладке «В здании».
@@ -1067,9 +1043,12 @@ class DgisCrawler:
         4. Иначе вкладка в браузере и «Загрузить ещё» до total.
         Здание с одной организацией сайт открывает как карточку этой организации (/firm/…):
         списка «В здании» там нет, сохраняется сама организация.
+        prefetched — (HTML, URL), уже полученные HTTP-запросом в пуле потоков (HTML None — не вышло).
         """
         url = f"{SITE}/{city.slug}/geo/{building_id}/tab/inside"
-        html, _ = self.scraper.fetch_html(page, url)
+        html = prefetched[0] if prefetched else None
+        if html is None:
+            html, _ = self.scraper.fetch_html(page, url)
         state = extract_initial_state(html or "")
         entities = state_entities(state)
         if not entities:
@@ -1091,10 +1070,10 @@ class DgisCrawler:
             for it in result.get("items") or []:
                 items[str(_to_int(it.get("id")))] = it
 
+        page = page or self.scraper.browser_page()
         listener = _items_listener(sink)
         page.on("response", listener)
         try:
-            self.scraper.pace(HTTP_COOLDOWN)
             if self.scraper.load_page(page, url) is None:
                 raise RuntimeError("вкладка «В здании» не загрузилась")
             self._load_more(page, lambda: len(items), total)
@@ -1131,7 +1110,7 @@ class DgisCrawler:
 
     # ------------------------------------------------------------------ каталог
 
-    def discover_rubrics(self, page: Page, city: City) -> List[Tuple[str, str]]:
+    def discover_rubrics(self, page: Optional[Page], city: City) -> List[Tuple[str, str]]:
         """
         Рубрики из рубрикатора города: /rubrics -> разделы -> подразделы (любой вложенности) ->
         /search/<имя>/rubricId/<id>. Обход только верхних разделов давал меньше: в Астане
@@ -1148,7 +1127,6 @@ class DgisCrawler:
             if sub_id in seen:
                 continue
             seen.add(sub_id)
-            self.scraper.pace(HTTP_COOLDOWN)
             sub, _ = self.scraper.fetch_html(page, f"{SITE}/{city.slug}/rubrics/subrubrics/{sub_id}")
             queue.extend(s for s in dict.fromkeys(pattern_sub.findall(sub or "")) if s not in seen)
             for raw_name, rid in pattern_leaf.findall(sub or ""):
@@ -1194,6 +1172,7 @@ class DgisCrawler:
         max_pages: int = 10_000,
         max_tasks: Optional[int] = None,
         fresh: bool = False,
+        only_buildings: bool = False,
     ) -> None:
         """
         Обход через очередь в БД. Семена: рубрикатор города + SEED_QUERIES
@@ -1206,49 +1185,96 @@ class DgisCrawler:
         if reset:
             logger.info("Возвращено в очередь незавершённых задач: %d", reset)
 
-        page = self.scraper.new_page()
-        try:
-            if queries:
-                self.storage.add_web_tasks(city.slug, "query", ((q, q) for q in queries))
-            elif not self.storage.web_task_done(city.slug, "rubricator", "all"):
-                # рубрикатор — один раз на город; новые рубрики потом приходят «снежным комом»
-                self.storage.add_web_tasks(city.slug, "rubricator", [("all", "рубрикатор")])
-                rubrics = self.discover_rubrics(page, city)
-                self.storage.add_web_tasks(city.slug, "rubric", rubrics)
-                self.storage.add_web_tasks(city.slug, "query", ((q, q) for q in SEED_QUERIES))
-                if rubrics:
-                    self.storage.set_web_task_result(city.slug, "rubricator", "all", "done", len(rubrics), len(rubrics))
+        if queries:
+            self.storage.add_web_tasks(city.slug, "query", ((q, q) for q in queries))
+        elif not only_buildings and not self.storage.web_task_done(city.slug, "rubricator", "all"):
+            # рубрикатор — один раз на город; новые рубрики потом приходят «снежным комом»
+            self.storage.add_web_tasks(city.slug, "rubricator", [("all", "рубрикатор")])
+            rubrics = self.discover_rubrics(None, city)
+            self.storage.add_web_tasks(city.slug, "rubric", rubrics)
+            self.storage.add_web_tasks(city.slug, "query", ((q, q) for q in SEED_QUERIES))
+            if rubrics:
+                self.storage.set_web_task_result(city.slug, "rubricator", "all", "done", len(rubrics), len(rubrics))
 
-            kinds = ["query", "rubric"] + (["building"] if buildings else [])
-            done = 0
-            while max_tasks is None or done < max_tasks:
-                page = self.scraper.recycle(page)
-                task = self.storage.claim_web_task(city.slug, kinds)
-                if task is None:
-                    break
-                self.heartbeat()
+        # only_buildings — только «В здании» (HTTP-воркер); рубрики, найденные внутри зданий,
+        # дособирает браузерный воркер на этапе recheck
+        kinds = ["building"] if only_buildings else ["query", "rubric"] + (["building"] if buildings else [])
+        done = 0
+        while max_tasks is None or done < max_tasks:
+            task = self.storage.claim_web_task(city.slug, kinds)
+            if task is None:
+                break
+            self.heartbeat()
+            if task["kind"] == "building":
+                # здания почти всегда закрываются HTTP-запросом — пачкой параллельно
+                batch = [task]
+                limit = self.scraper.http.concurrency * 8
+                if max_tasks is not None:
+                    limit = min(limit, max_tasks - done)
+                while len(batch) < limit:
+                    more = self.storage.claim_web_task(city.slug, ["building"])
+                    if more is None:
+                        break
+                    batch.append(more)
+                self._run_buildings(city, batch, expand)
+                done += len(batch)
+                continue
+            try:
+                self._run_task(None, city, task, expand, max_pages)
+            except (CaptchaBlockedError, NetworkDownError) as e:
+                self.storage.finish_web_task(task["id"], "pending", error=str(e))
+                raise
+            except KeyboardInterrupt:
+                self.storage.finish_web_task(task["id"], "pending", error="прервано вручную")
+                raise
+            except Exception as e:
+                self.storage.finish_web_task(task["id"], "error", error=str(e)[:1000])
+                logger.error("Задача %s %s: %s", task["kind"], task["label"] or task["key"], e)
+            done += 1
+            self.scraper.pace()
+
+    def _run_buildings(self, city: City, tasks: List[Dict[str, Any]], expand: bool) -> None:
+        """
+        Пачка задач «В здании»: HTTP-запросы вкладок — в пуле потоков; разбор, сверка с БД,
+        запись и (для длинных списков, которых нет в базе) браузер — в основном потоке.
+        Капча или обрыв сети: необработанные задачи пачки возвращаются в очередь.
+        """
+        def fetch(task: Dict[str, Any]) -> Tuple[Optional[str], str]:
+            url = f"{SITE}/{city.slug}/geo/{task['key']}/tab/inside"
+            try:
+                return self.scraper.http.get_html(url)
+            except Blocked:
+                return None, url
+
+        left = {t["id"]: t for t in tasks}
+        pool = ThreadPoolExecutor(max_workers=self.scraper.http.concurrency, thread_name_prefix="buildings")
+        try:
+            futures = {pool.submit(fetch, t): t for t in tasks}
+            for fut in self._completed(futures):
+                task = futures[fut]
                 try:
-                    self._run_task(page, city, task, expand, max_pages)
+                    self._run_task(None, city, task, expand, 0, prefetched=fut.result())
                 except (CaptchaBlockedError, NetworkDownError) as e:
-                    self.storage.finish_web_task(task["id"], "pending", error=str(e))
+                    for t in left.values():
+                        self.storage.finish_web_task(t["id"], "pending", error=str(e))
                     raise
                 except KeyboardInterrupt:
-                    self.storage.finish_web_task(task["id"], "pending", error="прервано вручную")
+                    for t in left.values():
+                        self.storage.finish_web_task(t["id"], "pending", error="прервано вручную")
                     raise
                 except Exception as e:
                     self.storage.finish_web_task(task["id"], "error", error=str(e)[:1000])
-                    logger.error("Задача %s %s: %s", task["kind"], task["label"] or task["key"], e)
-                done += 1
-                self.scraper.pace()
+                    logger.error("Здание %s: %s", task["label"] or task["key"], e)
+                left.pop(task["id"], None)
         finally:
-            page.context.close()
+            pool.shutdown(wait=True, cancel_futures=True)
 
-    def _run_task(self, page: Page, city: City, task: Dict[str, Any], expand: bool, max_pages: int
-                  ) -> List[Dict[str, Any]]:
+    def _run_task(self, page: Optional[Page], city: City, task: Dict[str, Any], expand: bool, max_pages: int,
+                  prefetched: Optional[Tuple[Optional[str], str]] = None) -> List[Dict[str, Any]]:
         """Выполняет задачу очереди. Объекты выдачи сохраняются постранично; для здания возвращает всё найденное."""
         kind, key, label = task["kind"], task["key"], task["label"]
         if kind == "building":
-            on_page, items, total, collected = self.crawl_building(page, city, key)
+            on_page, items, total, collected = self.crawl_building(page, city, key, prefetched)
             everything = on_page + items
             saved = self._ingest(city, everything, None, expand)
             # на странице здания — его полная карточка: отдельно её больше не запрашиваем
@@ -1289,31 +1315,68 @@ class DgisCrawler:
         Полная карточка и все отзывы каждого объекта. Для объекта с отзывами — один HTTP-запрос
         страницы /tab/reviews: в ней и полная карточка (контакты, соцсети, атрибуты), и первые 50
         отзывов; остальные отзывы и комментарии — из API отзывов, которым пользуется сам сайт
-        (по next_link), а если API не ответил — кликами «Загрузить ещё» в браузере, как раньше.
+        (по next_link). Сеть — в пуле потоков (self.scraper.http.concurrency запросов в полёте,
+        общий темп держит ограничитель); запись в БД и запасной путь через браузер (капча,
+        заглушка, API не ответил — клики «Загрузить ещё») — в основном потоке.
         rows: id, type, name, review_count, card_synced_at, reviews_synced_at.
         Возвращает разобранные карточки.
         """
         cards = []
-        page = self.scraper.new_page()
+        pool = ThreadPoolExecutor(max_workers=self.scraper.http.concurrency, thread_name_prefix="details")
         try:
-            for idx, row in enumerate(rows, 1):
-                page = self.scraper.recycle(page)
-                self.heartbeat()
-                card = self._object_details(page, city, row, reviews, f"{idx}/{len(rows)}")
+            futures = {pool.submit(self._fetch_details, city, row, reviews): row for row in rows}
+            for idx, fut in enumerate(self._completed(futures), 1):
+                card = self._save_details(city, futures[fut], fut.result(), reviews, f"{idx}/{len(rows)}")
                 if card:
                     cards.append(card)
-                self.scraper.pace(HTTP_COOLDOWN)
         finally:
-            page.context.close()
+            pool.shutdown(wait=True, cancel_futures=True)
         return cards
 
-    def _object_details(self, page: Page, city: City, row: Dict[str, Any], reviews: bool, progress: str
-                        ) -> Optional[Dict[str, Any]]:
-        obj_id = int(row["id"])
+    def _completed(self, futures: Iterable[Future]) -> Iterable[Future]:
+        """
+        Как as_completed, но раз в минуту отмечает «работа идёт», даже если потоки долго качают
+        длинные ленты (10 тыс. отзывов — ~20 мин): иначе план счёл бы этап брошенным.
+        """
+        pending = set(futures)
+        while pending:
+            done, pending = wait(pending, timeout=60, return_when=FIRST_COMPLETED)
+            self.heartbeat()
+            yield from done
+
+    def _detail_url(self, city: City, row: Dict[str, Any], reviews: bool) -> Tuple[str, bool, str]:
         need_reviews = reviews and int(row.get("review_count") or 0) > 0 and row.get("reviews_synced_at") is None
         section = "firm" if row.get("type", "branch") == "branch" else "geo"
-        url = f"{SITE}/{city.slug}/{section}/{obj_id}" + ("/tab/reviews" if need_reviews else "")
-        html, final_url = self.scraper.fetch_html(page, url)
+        url = f"{SITE}/{city.slug}/{section}/{int(row['id'])}" + ("/tab/reviews" if need_reviews else "")
+        return url, need_reviews, section
+
+    def _fetch_details(self, city: City, row: Dict[str, Any], reviews: bool) -> Dict[str, Any]:
+        """Сетевая часть (в потоке пула): HTML карточки и, если нужно, лента отзывов. Без БД и браузера."""
+        url, need_reviews, _ = self._detail_url(city, row, reviews)
+        result: Dict[str, Any] = {"html": None, "final_url": url, "reviews": None, "error": None}
+        try:
+            result["html"], result["final_url"] = self.scraper.http.get_html(url)
+        except Blocked:
+            return result  # капча/403/429 — основной поток откроет страницу в браузере
+        if result["html"] and need_reviews:
+            entity, got_id = pick_entity(result["html"], result["final_url"], row["id"])
+            if entity is not None:
+                try:
+                    result["reviews"] = self._reviews_via_api(result["html"], got_id)
+                except Exception as e:  # лента на странице не разобралась — объект останется в очереди
+                    result["error"] = str(e)
+        return result
+
+    def _save_details(self, city: City, row: Dict[str, Any], fetched: Dict[str, Any], reviews: bool,
+                      progress: str) -> Optional[Dict[str, Any]]:
+        """Основной поток: запасной путь через браузер, запись карточки и отзывов в БД."""
+        obj_id = int(row["id"])
+        url, need_reviews, section = self._detail_url(city, row, reviews)
+        html, final_url = fetched["html"], fetched["final_url"]
+        got = fetched["reviews"]
+        if html is None:
+            html, final_url = self.scraper.load_html(self.scraper.browser_page(), url)
+            got = None
         entity, got_id = pick_entity(html, final_url, obj_id)
         card = parse_branch(entity) if entity else None
         if card is None:
@@ -1330,9 +1393,13 @@ class DgisCrawler:
         note = ""
         if need_reviews:
             try:
-                got = self._reviews_via_api(page, html or "", got_id)
+                if fetched["error"]:
+                    raise RuntimeError(fetched["error"])
                 if got is None:
-                    got = self._fetch_reviews(page, f"{SITE}/{city.slug}/{section}/{got_id}/tab/reviews", got_id)
+                    got = self._reviews_via_api(html or "", got_id)
+                if got is None:
+                    got = self._fetch_reviews(self.scraper.browser_page(),
+                                              f"{SITE}/{city.slug}/{section}/{got_id}/tab/reviews", got_id)
             except (NetworkDownError, CaptchaBlockedError):
                 raise
             except Exception as e:
@@ -1347,8 +1414,7 @@ class DgisCrawler:
                 # в ленте нет, поэтому сверка с ним — только «0 собрано при непустой карточке»
                 want = int(row.get("review_count") or 0)
                 complete = ended and not (saved == 0 and want > 0)
-                synced = {obj_id, got_id}
-                for bid in synced:
+                for bid in {obj_id, got_id}:
                     (self.storage.mark_reviews_synced if complete else self.storage.mark_reviews_incomplete)(bid)
                 note = f", отзывов {saved} (в карточке {want}), комментариев {len(comments)}" + (
                     "" if complete else "  НЕПОЛНО — останется в очереди")
@@ -1356,7 +1422,7 @@ class DgisCrawler:
                     "" if got_id == obj_id else f" (перенаправлено с {obj_id})")
         return card
 
-    def _reviews_via_api(self, page: Page, html: str, branch_id: int
+    def _reviews_via_api(self, html: str, branch_id: int
                          ) -> Optional[Tuple[List[Dict[str, Any]], List[Dict[str, Any]], bool]]:
         """
         Отзывы по цепочке next_link из встроенной ленты + комментарии к ним — теми же запросами
@@ -1377,13 +1443,14 @@ class DgisCrawler:
         seen_links = set()
         while link and link not in seen_links:
             seen_links.add(link)
-            self.scraper.pace(API_COOLDOWN)
-            data = self.scraper.fetch_json(page, link)
+            data = self.scraper.http.get_json(link)
             if data is None:
                 return None
             batch = [r for r in data.get("reviews") or [] if isinstance(r, dict) and r.get("id")]
             for r in batch:
                 found[str(r["id"])] = r
+            if len(seen_links) % 20 == 0:
+                logger.info("Отзывы %s: собрано %d из %s", branch_id, len(found), feed.total)
             link = (data.get("meta") or {}).get("next_link") if batch else None
 
         comments: List[Dict[str, Any]] = []
@@ -1401,9 +1468,11 @@ class DgisCrawler:
                 with_comments.append(rid)
         if with_comments and not key:
             return None
+        if len(with_comments) > 100:
+            logger.info("Отзывы %s: %d отзывов, комментарии запрашиваются к %d", branch_id, len(found),
+                        len(with_comments))
         for rid in with_comments:
-            self.scraper.pace(API_COOLDOWN)
-            data = self.scraper.fetch_json(page, f"{REVIEWS_API}/2.0/reviews/{rid}/comments?key={key}&locale=ru_KZ")
+            data = self.scraper.http.get_json(f"{REVIEWS_API}/2.0/reviews/{rid}/comments?key={key}&locale=ru_KZ")
             if data is None:
                 return None
             comments.extend(parse_review_comment(c, rid, branch_id)
@@ -1541,29 +1610,12 @@ class DgisCrawler:
             str(c["building_id"]) for c in cards if c.get("building_id")
         }
 
-        # «В здании» у каждого здания района
-        page = self.scraper.new_page()
-        try:
-            self.storage.add_web_tasks(city.slug, "building", ((b, None) for b in buildings))
-            for bid in sorted(buildings):
-                page = self.scraper.recycle(page)
-                task = self.storage.claim_web_task_by_key(city.slug, "building", bid, MAX_TASK_ATTEMPTS)
-                if task is None:
-                    continue  # уже собрано раньше
-                try:
-                    self._run_task(page, city, task, expand=True, max_pages=0)
-                except (CaptchaBlockedError, NetworkDownError) as e:
-                    self.storage.finish_web_task(task["id"], "pending", error=str(e))
-                    raise
-                except KeyboardInterrupt:
-                    self.storage.finish_web_task(task["id"], "pending", error="прервано вручную")
-                    raise
-                except Exception as e:
-                    self.storage.finish_web_task(task["id"], "error", error=str(e)[:1000])
-                    logger.error("Здание %s: %s", bid, e)
-                self.scraper.pace()
-        finally:
-            page.context.close()
+        # «В здании» у каждого здания района (уже собранные раньше пропускаются)
+        self.storage.add_web_tasks(city.slug, "building", ((b, None) for b in buildings))
+        tasks = [t for t in (self.storage.claim_web_task_by_key(city.slug, "building", bid, MAX_TASK_ATTEMPTS)
+                             for bid in sorted(buildings)) if t]
+        if tasks:
+            self._run_buildings(city, tasks, expand=True)
         area_ids |= set(self.storage.branch_ids_in_buildings([_to_int(b) for b in buildings]))
         area_ids |= {_to_int(b) for b in buildings}
         area_ids.discard(None)
@@ -1598,37 +1650,32 @@ class DgisCrawler:
         ))
         stops: Dict[str, Dict[str, Any]] = {}
         routes: Dict[str, Dict[str, Any]] = {}
-        page = self.scraper.new_page()
-        try:
-            for q in queries:
-                if self.storage.web_task_done(city.slug, "transport", q):
-                    continue  # собрано прошлым запуском; маршруты и остановки ниже дособираются из БД
-                url = f"{SITE}/{city.slug}/search/{urllib.parse.quote(q, safe='')}"
-                self.storage.add_web_tasks(city.slug, "transport", [(q, q)])
-                items: List[Dict[str, Any]] = []
-                for attempt in range(1, MAX_TASK_ATTEMPTS + 1):
-                    page = self.scraper.recycle(page)
-                    run = self.paginate_search(page, url, max_pages)
-                    items.extend(run.items)
-                    unique = len({str(_to_int(i.get("id"))) for i in items})
-                    logger.info("[транспорт] %s: собрано %d из %s (стр. %d/%d), попытка %d%s",
-                                q, unique, run.total, run.pages_done, run.pages_total, attempt,
-                                "" if run.complete else "  НЕПОЛНО")
-                    self.scraper.pace()
-                    if run.complete:
-                        break
-                self.storage.set_web_task_result(city.slug, "transport", q,
-                                                 "done" if run.complete else "incomplete", run.total, unique)
-                for item in self.in_city(city, items):
-                    if item.get("type") == "station" or item.get("route_type"):
-                        stop = stop_from_item(item, city.slug, city.region, city.name)
-                        if stop:
-                            stops[stop["id"]] = stop
-                    elif item.get("type") == "route":
-                        route = route_from_item(item, city.slug)
-                        routes[route["id"]] = route
-        finally:
-            page.context.close()
+        for q in queries:
+            if self.storage.web_task_done(city.slug, "transport", q):
+                continue  # собрано прошлым запуском; маршруты и остановки ниже дособираются из БД
+            url = f"{SITE}/{city.slug}/search/{urllib.parse.quote(q, safe='')}"
+            self.storage.add_web_tasks(city.slug, "transport", [(q, q)])
+            items: List[Dict[str, Any]] = []
+            for attempt in range(1, MAX_TASK_ATTEMPTS + 1):
+                run = self.paginate_search(None, url, max_pages)
+                items.extend(run.items)
+                unique = len({str(_to_int(i.get("id"))) for i in items})
+                logger.info("[транспорт] %s: собрано %d из %s (стр. %d/%d), попытка %d%s",
+                            q, unique, run.total, run.pages_done, run.pages_total, attempt,
+                            "" if run.complete else "  НЕПОЛНО")
+                self.scraper.pace()
+                if run.complete:
+                    break
+            self.storage.set_web_task_result(city.slug, "transport", q,
+                                             "done" if run.complete else "incomplete", run.total, unique)
+            for item in self.in_city(city, items):
+                if item.get("type") == "station" or item.get("route_type"):
+                    stop = stop_from_item(item, city.slug, city.region, city.name)
+                    if stop:
+                        stops[stop["id"]] = stop
+                elif item.get("type") == "route":
+                    route = route_from_item(item, city.slug)
+                    routes[route["id"]] = route
 
         for stop in stops.values():
             for r in stop["routes"]:
@@ -1659,52 +1706,45 @@ class DgisCrawler:
             if (r["raw"] or {}).get("region_id") is None or self.in_city(city, [r["raw"]])
         ]
         logger.info("Маршруты %s: страниц к обходу %d (найдено в этом запуске %d)", city.slug, len(todo), len(routes))
-        page = self.scraper.new_page()
-        try:
-            for idx, route in enumerate(todo, 1):
-                page = self.scraper.recycle(page)
-                self.heartbeat()
-                html, _ = self.scraper.fetch_html(page, f"{SITE}/{city.slug}/route/{route['id']}")
-                entity = state_entities(extract_initial_state(html or "")).get(route["id"])
-                if not entity:
-                    logger.warning("Маршрут %s (%s) не получен", route["id"], route.get("name"))
-                    self.scraper.pace(HTTP_COOLDOWN)
-                    continue
-                platforms, stops, links = [], {}, []
-                for d_no, direction in enumerate(entity.get("directions") or []):
-                    for seq, p in enumerate(direction.get("platforms") or [], 1):
-                        m = re.match(r"POINT\(([\d.]+) ([\d.]+)\)", (p.get("geometry") or {}).get("centroid") or "")
-                        lon, lat = (float(m.group(1)), float(m.group(2))) if m else (None, None)
-                        stop_id = str(p.get("station_id") or p.get("id"))
-                        platforms.append({
-                            "city_slug": city.slug, "route_id": route["id"], "direction_no": d_no,
-                            "direction_type": direction.get("type"), "seq": seq, "platform_id": p.get("id"),
-                            "stop_id": stop_id, "stop_name": p.get("name"), "lat": lat, "lon": lon,
-                        })
-                        stops.setdefault(stop_id, {
-                            "id": stop_id, "name": p.get("name") or "", "type": "station",
-                            "subtype": entity.get("subtype") or route.get("subtype"), "lat": lat, "lon": lon,
-                            "district": None, "region": city.region, "city": city.name, "city_slug": city.slug,
-                            "raw": None,
-                        })
-                        links.append({
-                            "region": city.region, "city": city.name, "city_slug": city.slug,
-                            "route_id": route["id"], "route_number": entity.get("name") or route.get("name"),
-                            "route_subtype": entity.get("subtype") or route.get("subtype") or "bus",
-                            "route_from": entity.get("from_name"), "route_to": entity.get("to_name"),
-                            "stop_id": stop_id, "stop_name": p.get("name"), "lat": lat, "lon": lon,
-                            "district": None, "color": route.get("color"),
-                        })
-                self.storage.save_route_platforms(city.slug, route["id"], platforms)
-                self.storage.mark_route_platforms_synced(city.slug, route["id"])
-                self.storage.save_missing_transport_stops(list(stops.values()))
-                self.storage.save_transport_route_stops(links)
-                logger.info("[маршрут %d/%d] %s %s: направлений %d, остановок %d",
-                            idx, len(todo), route.get("subtype"), route.get("name"),
-                            len(entity.get("directions") or []), len(platforms))
-                self.scraper.pace(HTTP_COOLDOWN)
-        finally:
-            page.context.close()
+        for idx, route in enumerate(todo, 1):
+            self.heartbeat()
+            html, _ = self.scraper.fetch_html(None, f"{SITE}/{city.slug}/route/{route['id']}")
+            entity = state_entities(extract_initial_state(html or "")).get(route["id"])
+            if not entity:
+                logger.warning("Маршрут %s (%s) не получен", route["id"], route.get("name"))
+                continue
+            platforms, stops, links = [], {}, []
+            for d_no, direction in enumerate(entity.get("directions") or []):
+                for seq, p in enumerate(direction.get("platforms") or [], 1):
+                    m = re.match(r"POINT\(([\d.]+) ([\d.]+)\)", (p.get("geometry") or {}).get("centroid") or "")
+                    lon, lat = (float(m.group(1)), float(m.group(2))) if m else (None, None)
+                    stop_id = str(p.get("station_id") or p.get("id"))
+                    platforms.append({
+                        "city_slug": city.slug, "route_id": route["id"], "direction_no": d_no,
+                        "direction_type": direction.get("type"), "seq": seq, "platform_id": p.get("id"),
+                        "stop_id": stop_id, "stop_name": p.get("name"), "lat": lat, "lon": lon,
+                    })
+                    stops.setdefault(stop_id, {
+                        "id": stop_id, "name": p.get("name") or "", "type": "station",
+                        "subtype": entity.get("subtype") or route.get("subtype"), "lat": lat, "lon": lon,
+                        "district": None, "region": city.region, "city": city.name, "city_slug": city.slug,
+                        "raw": None,
+                    })
+                    links.append({
+                        "region": city.region, "city": city.name, "city_slug": city.slug,
+                        "route_id": route["id"], "route_number": entity.get("name") or route.get("name"),
+                        "route_subtype": entity.get("subtype") or route.get("subtype") or "bus",
+                        "route_from": entity.get("from_name"), "route_to": entity.get("to_name"),
+                        "stop_id": stop_id, "stop_name": p.get("name"), "lat": lat, "lon": lon,
+                        "district": None, "color": route.get("color"),
+                    })
+            self.storage.save_route_platforms(city.slug, route["id"], platforms)
+            self.storage.mark_route_platforms_synced(city.slug, route["id"])
+            self.storage.save_missing_transport_stops(list(stops.values()))
+            self.storage.save_transport_route_stops(links)
+            logger.info("[маршрут %d/%d] %s %s: направлений %d, остановок %d",
+                        idx, len(todo), route.get("subtype"), route.get("name"),
+                        len(entity.get("directions") or []), len(platforms))
 
     def enrich_stops(self, city: City) -> None:
         """
@@ -1715,26 +1755,20 @@ class DgisCrawler:
         """
         rows = self.storage.stops_without_address(city.slug)
         logger.info("Остановок без адреса: %d — открываем их карточки", len(rows))
-        page = self.scraper.new_page()
-        try:
-            for idx, row in enumerate(rows, 1):
-                page = self.scraper.recycle(page)
-                self.heartbeat()
-                html, final_url = self.scraper.fetch_html(page, f"{SITE}/{city.slug}/geo/{row['id']}")
-                entity, got_id = pick_entity(html, final_url, row["id"])
-                stop = stop_from_item(entity, city.slug, city.region, city.name) if entity else None
-                if stop:
-                    stop["id"] = str(row["id"])
-                    self.storage.save_transport_stops([stop])
-                    if got_id != int(row["id"]):
-                        self.storage.merge_stop(city.slug, keep_id=str(row["id"]), dup_id=str(got_id))
-                else:
-                    logger.warning("Остановка %s (%s) не получена", row["id"], row["name"])
-                if idx % 50 == 0:
-                    logger.info("[остановки] %d/%d", idx, len(rows))
-                self.scraper.pace(HTTP_COOLDOWN)
-        finally:
-            page.context.close()
+        for idx, row in enumerate(rows, 1):
+            self.heartbeat()
+            html, final_url = self.scraper.fetch_html(None, f"{SITE}/{city.slug}/geo/{row['id']}")
+            entity, got_id = pick_entity(html, final_url, row["id"])
+            stop = stop_from_item(entity, city.slug, city.region, city.name) if entity else None
+            if stop:
+                stop["id"] = str(row["id"])
+                self.storage.save_transport_stops([stop])
+                if got_id != int(row["id"]):
+                    self.storage.merge_stop(city.slug, keep_id=str(row["id"]), dup_id=str(got_id))
+            else:
+                logger.warning("Остановка %s (%s) не получена", row["id"], row["name"])
+            if idx % 50 == 0:
+                logger.info("[остановки] %d/%d", idx, len(rows))
         merged = self.storage.merge_redirected_stops(city.slug)
         if merged:
             logger.info("Слито дублей станций (карточка-организация + остановка маршрута): %d", merged)
@@ -1793,11 +1827,7 @@ class DgisCrawler:
         """
         if not city.region_id or self.storage.region_fresh(int(city.region_id)):
             return
-        page = self.scraper.new_page()
-        try:
-            html, _ = self.scraper.fetch_html(page, f"{SITE}/{city.slug}")
-        finally:
-            page.context.close()
+        html, _ = self.scraper.fetch_html(None, f"{SITE}/{city.slug}")
         profile = ((((extract_initial_state(html or "") or {}).get("data") or {}).get("region") or {})
                    .get("profile") or {}).get(str(city.region_id))
         data = (profile or {}).get("data")
@@ -1820,11 +1850,12 @@ class DgisCrawler:
         if stage == "transport":
             self.crawl_transport(city, ("all",))
             return True
-        if stage in ("catalog", "buildings"):
-            with_buildings = stage == "buildings"
-            self.crawl_catalog(city, buildings=with_buildings)
-            kinds = ["query", "rubric"] + (["building"] if with_buildings else [])
-            return self.storage.open_web_tasks(city.slug, kinds, MAX_TASK_ATTEMPTS) == 0
+        if stage == "catalog":
+            self.crawl_catalog(city, buildings=False)
+            return self.storage.open_web_tasks(city.slug, ["query", "rubric"], MAX_TASK_ATTEMPTS) == 0
+        if stage == "buildings":
+            self.crawl_catalog(city, only_buildings=True)
+            return self.storage.open_web_tasks(city.slug, ["building"], MAX_TASK_ATTEMPTS) == 0
         if stage == "details":
             return self._details_until_done(city)
         if stage == "recheck":

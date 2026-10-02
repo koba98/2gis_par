@@ -139,6 +139,9 @@ def parse_arguments() -> argparse.Namespace:
                          help="предохранитель: максимум страниц на один запрос")
     browser.add_argument("--pace", type=float, default=float(os.getenv("DGIS_PACE", "1.0")),
                          help="множитель антибан-пауз: 1.0 — как есть, 1.5 — осторожнее (env DGIS_PACE)")
+    browser.add_argument("--concurrency", type=int, default=int(os.getenv("DGIS_CONCURRENCY", "3")),
+                         help="HTTP-запросов в полёте параллельно (карточки, отзывы, здания); общий темп "
+                              "держит адаптивный ограничитель (env DGIS_CONCURRENCY)")
     browser.add_argument("--captcha-wait", type=int, default=int(os.getenv("DGIS_CAPTCHA_WAIT", "120")),
                          help="сколько секунд ждать, пока капчу решат в окне; 0 — на сервере без человека")
 
@@ -169,6 +172,9 @@ def parse_arguments() -> argparse.Namespace:
     kz.add_argument("--worker", default=os.getenv("DGIS_WORKER") or socket.gethostname(),
                     help="имя воркера в плане (env DGIS_WORKER)")
     kz.add_argument("--once", action="store_true", help="выполнить один этап и выйти")
+    kz.add_argument("--stages", default=os.getenv("DGIS_STAGES"),
+                    help="брать только эти этапы через запятую (transport,catalog,buildings,details,recheck): "
+                         "браузерный и HTTP-воркер работают конвейером (env DGIS_STAGES)")
     sub.add_parser("catalog", parents=[common, browser, catalog], help="все объекты города")
     sub.add_parser("transport", parents=[common, browser, transport], help="остановки и маршруты")
     sub.add_parser("crawl", parents=[common, browser, catalog, transport], help="transport + catalog")
@@ -200,7 +206,28 @@ def kz_plan_jobs() -> List[Tuple[str, str, int, int]]:
     return jobs
 
 
-def run_kz(storage: SyncStorage, crawler: DgisCrawler, tiers: List[int], worker: str, once: bool) -> None:
+def details_ahead(storage: SyncStorage, crawler: DgisCrawler, tiers: List[int], batch: int = 300) -> bool:
+    """
+    Работа впрок для HTTP-воркера, пока этапы ждут каталога: карточки и отзывы объектов, которые
+    каталог уже нашёл (город по порядку плана). Этап details потом найдёт меньше работы.
+    False — делать нечего. Капча или обрыв сети — пауза, как у этапов.
+    """
+    for city in (c for c in CITIES if c.tier in tiers):
+        rows = storage.objects_for_details(int(city.region_id), city.name, batch)
+        if not rows:
+            continue
+        logger.info("Пока этапы ждут каталога — карточки и отзывы впрок: %s, %d объектов", city.name, len(rows))
+        try:
+            crawler.crawl_details(city, rows)
+        except (CaptchaBlockedError, NetworkDownError) as e:
+            logger.error("%s — пауза %d мин", e, CAPTCHA_BACKOFF_MIN[0])
+            time.sleep(CAPTCHA_BACKOFF_MIN[0] * 60)
+        return True
+    return False
+
+
+def run_kz(storage: SyncStorage, crawler: DgisCrawler, tiers: List[int], worker: str, once: bool,
+           stages: Optional[List[str]] = None) -> None:
     """
     Воркер плана: берёт следующий этап (город × этап) и выполняет его. Капча или обрыв сети —
     этап откладывается (15 мин, 30, 60, далее каждые 2 ч) и воркер берёт следующий доступный;
@@ -210,14 +237,17 @@ def run_kz(storage: SyncStorage, crawler: DgisCrawler, tiers: List[int], worker:
     storage.init_plan(kz_plan_jobs())
     blocked_in_row = 0
     while True:
-        job = storage.claim_plan_job(tiers, worker)
+        job = storage.claim_plan_job(tiers, worker, stages=stages)
         if job is None:
-            left = [r for r in storage.plan_status() if r["tier"] in tiers and r["status"] != "done"]
+            left = [r for r in storage.plan_status() if r["tier"] in tiers and r["status"] != "done"
+                    and (not stages or r["stage"] in stages)]
             if not left:
                 logger.info("План kz выполнен для волн %s.", ",".join(map(str, tiers)))
                 return
             if once:
                 return
+            if stages and "details" in stages and details_ahead(storage, crawler, tiers):
+                continue
             logger.info("Свободных этапов нет (ждут: %d, заняты другими воркерами или отложены) — ждём 5 мин",
                         len(left))
             time.sleep(300)
@@ -306,10 +336,12 @@ def main() -> None:
     subtypes = tuple(t.strip() for t in getattr(args, "subtypes", "").split(",") if t.strip())
     with DgisBrowserScraper(args.headless, args.channel, load_proxies(args.proxies, args.proxy),
                             map_mode=args.command == "area", pace_factor=args.pace,
-                            captcha_wait=args.captcha_wait) as scraper:
+                            captcha_wait=args.captcha_wait, concurrency=args.concurrency) as scraper:
         crawler = DgisCrawler(scraper, storage)
         if args.command == "kz":
-            run_kz(storage, crawler, [int(t) for t in args.tiers.split(",") if t.strip()], args.worker, args.once)
+            stages = [x.strip() for x in (args.stages or "").split(",") if x.strip()] or None
+            run_kz(storage, crawler, [int(t) for t in args.tiers.split(",") if t.strip()], args.worker, args.once,
+                   stages)
             return
         for city in cities:
             logger.info("=== %s (%s): %s ===", city.name, city.slug, args.command)

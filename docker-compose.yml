@@ -1,23 +1,28 @@
 # Запуск на сервере.
-#   Весь Казахстан по волнам (воркер работает сам, после капчи/обрыва сети ждёт и продолжает):
-#     docker compose up -d kz            # логи: docker compose logs -f kz
+#   Весь Казахстан по волнам — два воркера конвейером на одном плане в БД:
+#     docker compose up -d kz kz-http    # логи: docker compose logs -f kz kz-http
 #     docker compose run --rm parser plan    # что уже выполнено
 #     docker compose run --rm parser stats   # полнота: заявлено 2ГИС / собрано по городам
 #   Разовая команда:  docker compose run --rm parser catalog -r Астана
-# Второй воркер имеет смысл только с другим IP: раскомментируйте kz2 и задайте DGIS_PROXY_2 в .env.
-# Память одного воркера (замерено в этом образе с этими лимитами):
-#   карточки и отзывы (HTTP) — ~330 МБ ровно, без роста;
-#   каталог — обычно 0,6–1 ГБ; самая длинная выдача (351–389 страниц кликами) — пик 1,26 ГБ:
-#   Chrome на виртуальном дисплее растёт ~1 МБ на страницу выдачи, Python — до ~90 МБ.
+#
+# kz      — браузер: транспорт, каталог (листание выдачи кликами), добор.
+# kz-http — без браузера: «В здании», карточки и отзывы (HTTP-запросы, 3 параллельно, общий
+#           адаптивный темп). Пока kz листает каталог следующего города, kz-http дособирает
+#           карточки предыдущего. Chrome в kz-http запускается только как запасной путь.
+# Ещё воркеры имеет смысл добавлять только с другими IP (DGIS_PROXY), иначе 2ГИС быстрее
+# начнёт показывать капчу.
+#
+# Память (замерено в этом образе с этими лимитами): kz — обычно 0,6–1 ГБ, самая длинная выдача
+# (351–389 страниц кликами) — пик 1,26 ГБ; kz-http — ~100–150 МБ, с запасным Chrome до ~1 ГБ.
 # mem_limit — жёсткий потолок: больше контейнер не возьмёт, другие сервисы на сервере не пострадают
 # (при упоре в лимит перезапустится только этот воркер, этап продолжится с места остановки).
 x-parser: &parser
   build: .
-  env_file: .env                  # PG_DSN, PG_SCHEMA, DGIS_PACE, DGIS_PROXY
+  env_file: .env                  # PG_DSN, PG_SCHEMA, DGIS_PACE, DGIS_PROXY, DGIS_CONCURRENCY
   network_mode: host              # доступ к PostgreSQL на хосте по localhost
   init: true                      # tini: собирает завершившиеся процессы Chrome
   shm_size: "512m"                # Chrome использует /dev/shm
-  mem_limit: "2560m"              # жёсткий потолок памяти на один воркер (запас под длинные выдачи Алматы)
+  mem_limit: "2560m"              # жёсткий потолок памяти (запас под длинные выдачи Алматы)
   cpus: "1.5"
   volumes:
     - ./output:/app/output        # CSV и кэш сканов районов
@@ -29,10 +34,12 @@ services:
 
   kz:
     <<: *parser
-    command: ["kz", "--captcha-wait", "0", "--worker", "kz-1"]
+    command: ["kz", "--captcha-wait", "0", "--worker", "kz-browser", "--stages", "transport,catalog,recheck"]
     restart: unless-stopped
 
-  # kz2:
-  #   <<: *parser
-  #   command: ["kz", "--captcha-wait", "0", "--worker", "kz-2", "--proxy", "${DGIS_PROXY_2}"]
-  #   restart: unless-stopped
+  kz-http:
+    <<: *parser
+    command: ["kz", "--captcha-wait", "0", "--worker", "kz-http", "--stages", "buildings,details"]
+    mem_limit: "1536m"
+    cpus: "1.0"
+    restart: unless-stopped
