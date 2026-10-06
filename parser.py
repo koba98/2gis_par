@@ -1331,6 +1331,7 @@ class DgisCrawler:
                     cards.append(card)
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
+            self.storage.release_details_lease([int(r["id"]) for r in rows])
         return cards
 
     def _completed(self, futures: Iterable[Future]) -> Iterable[Future]:
@@ -1866,7 +1867,7 @@ class DgisCrawler:
             return self._details_until_done(city) and done
         raise ValueError(f"неизвестный этап: {stage}")
 
-    def _details_until_done(self, city: City, batch: int = 500) -> bool:
+    def _details_until_done(self, city: City, batch: int = 150) -> bool:
         """Карточки и отзывы объектов города пачками: сначала сам город, потом населённые пункты-спутники."""
         while True:
             rows = self.storage.objects_for_details(int(city.region_id), city.name, batch)

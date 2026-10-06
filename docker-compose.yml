@@ -1,16 +1,21 @@
 # Запуск на сервере.
-#   Весь Казахстан по волнам — два воркера конвейером на одном плане в БД:
+#   Весь Казахстан по волнам — воркеры на одном плане в БД:
 #     docker compose up -d kz kz-http    # логи: docker compose logs -f kz kz-http
+#     docker compose run --rm parser check   # проверка окружения: БД, доступ к 2ГИС, Chrome
 #     docker compose run --rm parser plan    # что уже выполнено
 #     docker compose run --rm parser stats   # полнота: заявлено 2ГИС / собрано по городам
 #   Разовая команда:  docker compose run --rm parser catalog -r Астана
 #
 # kz      — браузер: транспорт, каталог (листание выдачи кликами), добор.
-# kz-http — без браузера: «В здании», карточки и отзывы (HTTP-запросы, 3 параллельно, общий
+# kz-http — без браузера: «В здании», карточки и отзывы (HTTP, 3 запроса в полёте, общий
 #           адаптивный темп). Пока kz листает каталог следующего города, kz-http дособирает
 #           карточки предыдущего. Chrome в kz-http запускается только как запасной путь.
-# Ещё воркеры имеет смысл добавлять только с другими IP (DGIS_PROXY), иначе 2ГИС быстрее
-# начнёт показывать капчу.
+#
+# Скорость упирается в IP: 2ГИС ограничивает частоту запросов с адреса. Каждая следующая пара
+# воркеров на своём прокси (DGIS_PROXY_2..4 в .env) добавляет почти столько же скорости, сколько
+# первая; большой город они собирают вместе. Запуск пар 2–4:
+#     docker compose --profile proxy2 --profile proxy3 up -d
+# Без прокси эти воркеры не стартуют (--require-proxy).
 #
 # Память (замерено в этом образе с этими лимитами): kz — обычно 0,6–1 ГБ, самая длинная выдача
 # (351–389 страниц кликами) — пик 1,26 ГБ; kz-http — ~100–150 МБ, с запасным Chrome до ~1 ГБ.
@@ -27,19 +32,58 @@ x-parser: &parser
   volumes:
     - ./output:/app/output        # CSV и кэш сканов районов
 
+x-browser: &browser
+  <<: *parser
+  restart: unless-stopped
+
+x-http: &http
+  <<: *parser
+  mem_limit: "1536m"
+  cpus: "1.0"
+  restart: unless-stopped
+
 services:
   parser:
     <<: *parser
     restart: "no"
 
   kz:
-    <<: *parser
+    <<: *browser
     command: ["kz", "--captcha-wait", "0", "--worker", "kz-browser", "--stages", "transport,catalog,recheck"]
-    restart: unless-stopped
 
   kz-http:
-    <<: *parser
+    <<: *http
     command: ["kz", "--captcha-wait", "0", "--worker", "kz-http", "--stages", "buildings,details"]
-    mem_limit: "1536m"
-    cpus: "1.0"
-    restart: unless-stopped
+
+  kz-2:
+    <<: *browser
+    profiles: ["proxy2"]
+    command: ["kz", "--captcha-wait", "0", "--worker", "kz-browser-2", "--stages", "transport,catalog,recheck",
+              "--require-proxy", "--proxy", "${DGIS_PROXY_2:-}"]
+  kz-http-2:
+    <<: *http
+    profiles: ["proxy2"]
+    command: ["kz", "--captcha-wait", "0", "--worker", "kz-http-2", "--stages", "buildings,details",
+              "--require-proxy", "--proxy", "${DGIS_PROXY_2:-}"]
+
+  kz-3:
+    <<: *browser
+    profiles: ["proxy3"]
+    command: ["kz", "--captcha-wait", "0", "--worker", "kz-browser-3", "--stages", "transport,catalog,recheck",
+              "--require-proxy", "--proxy", "${DGIS_PROXY_3:-}"]
+  kz-http-3:
+    <<: *http
+    profiles: ["proxy3"]
+    command: ["kz", "--captcha-wait", "0", "--worker", "kz-http-3", "--stages", "buildings,details",
+              "--require-proxy", "--proxy", "${DGIS_PROXY_3:-}"]
+
+  kz-4:
+    <<: *browser
+    profiles: ["proxy4"]
+    command: ["kz", "--captcha-wait", "0", "--worker", "kz-browser-4", "--stages", "transport,catalog,recheck",
+              "--require-proxy", "--proxy", "${DGIS_PROXY_4:-}"]
+  kz-http-4:
+    <<: *http
+    profiles: ["proxy4"]
+    command: ["kz", "--captcha-wait", "0", "--worker", "kz-http-4", "--stages", "buildings,details",
+              "--require-proxy", "--proxy", "${DGIS_PROXY_4:-}"]

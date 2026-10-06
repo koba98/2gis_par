@@ -112,6 +112,8 @@ CREATE INDEX IF NOT EXISTS idx_branches_org ON branches (org_id);
 CREATE INDEX IF NOT EXISTS idx_branches_region ON branches (region_id);
 CREATE INDEX IF NOT EXISTS idx_branches_reviews_synced ON branches (reviews_synced_at NULLS FIRST);
 CREATE INDEX IF NOT EXISTS idx_branches_building ON branches (building_id);
+ALTER TABLE branches ADD COLUMN IF NOT EXISTS details_lease_until timestamptz;
+COMMENT ON COLUMN branches.details_lease_until IS 'Объект взят воркером в сбор карточки/отзывов до этого времени (несколько воркеров собирают один город без повторов)';
 
 -- Связь филиал <-> рубрика
 CREATE TABLE IF NOT EXISTS branch_rubrics (

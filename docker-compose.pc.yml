@@ -2,10 +2,16 @@
 # сеть хоста, как на Linux. Обычная сеть Docker выходит в интернет и к серверу БД через NAT.
 #   docker compose -f docker-compose.yml -f docker-compose.pc.yml up -d kz kz-http
 # Если PostgreSQL стоит на этом же компьютере — в PG_DSN вместо localhost пишите host.docker.internal.
+x-pc: &pc
+  network_mode: bridge
+
 services:
-  parser:
-    network_mode: bridge
-  kz:
-    network_mode: bridge
-  kz-http:
-    network_mode: bridge
+  parser: *pc
+  kz: *pc
+  kz-http: *pc
+  kz-2: *pc
+  kz-http-2: *pc
+  kz-3: *pc
+  kz-http-3: *pc
+  kz-4: *pc
+  kz-http-4: *pc

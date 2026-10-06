@@ -165,6 +165,8 @@ def parse_arguments() -> argparse.Namespace:
     stats = sub.add_parser("stats", parents=[common], help="статистика и полнота обхода")
     stats.add_argument("-r", "--region", help="только этот город")
     sub.add_parser("plan", parents=[common], help="состояние плана kz")
+    sub.add_parser("check", parents=[common, browser],
+                   help="проверка окружения: БД, доступ к 2ГИС (по каждому прокси), API отзывов, Chrome")
     kz = sub.add_parser("kz", parents=[common, browser],
                         help="весь Казахстан по волнам: крупные города, областные центры, малые города, добор")
     kz.add_argument("--tiers", default="1,2,3,4",
@@ -172,6 +174,8 @@ def parse_arguments() -> argparse.Namespace:
     kz.add_argument("--worker", default=os.getenv("DGIS_WORKER") or socket.gethostname(),
                     help="имя воркера в плане (env DGIS_WORKER)")
     kz.add_argument("--once", action="store_true", help="выполнить один этап и выйти")
+    kz.add_argument("--require-proxy", action="store_true",
+                    help="не запускаться без прокси (воркеры 2–4: иначе они нагрузят тот же IP, что и первый)")
     kz.add_argument("--stages", default=os.getenv("DGIS_STAGES"),
                     help="брать только эти этапы через запятую (transport,catalog,buildings,details,recheck): "
                          "браузерный и HTTP-воркер работают конвейером (env DGIS_STAGES)")
@@ -236,8 +240,11 @@ def run_kz(storage: SyncStorage, crawler: DgisCrawler, tiers: List[int], worker:
     by_slug = {c.slug: c for c in CITIES}
     storage.init_plan(kz_plan_jobs())
     blocked_in_row = 0
+    skip_until: Dict[str, float] = {}  # «город/этап» -> до какого времени этот воркер его пропускает
     while True:
-        job = storage.claim_plan_job(tiers, worker, stages=stages)
+        now = time.monotonic()
+        job = storage.claim_plan_job(tiers, worker, stages=stages,
+                                     exclude=[k for k, t in skip_until.items() if t > now])
         if job is None:
             left = [r for r in storage.plan_status() if r["tier"] in tiers and r["status"] != "done"
                     and (not stages or r["stage"] in stages)]
@@ -269,7 +276,9 @@ def run_kz(storage: SyncStorage, crawler: DgisCrawler, tiers: List[int], worker:
         except (CaptchaBlockedError, NetworkDownError) as e:
             delay = CAPTCHA_BACKOFF_MIN[min(blocked_in_row, len(CAPTCHA_BACKOFF_MIN) - 1)]
             blocked_in_row += 1
-            storage.finish_plan_job(city.slug, stage, "pending", error=str(e)[:500], delay_minutes=delay)
+            # блокируют IP этого воркера: общий этап не откладываем — воркеры на других IP его продолжают
+            storage.finish_plan_job(city.slug, stage, "pending", error=str(e)[:500],
+                                    delay_minutes=0 if stage in storage.SHARED_STAGES else delay)
             logger.error("%s — этап %s/%s отложен на %d мин", e, city.slug, stage, delay)
             # блокируют IP, а не этап: пауза и для самого воркера (с разбросом, чтобы воркеры не шли строем)
             time.sleep(delay * 60 * random.uniform(0.8, 1.0))
@@ -291,10 +300,89 @@ def run_kz(storage: SyncStorage, crawler: DgisCrawler, tiers: List[int], worker:
 
         blocked_in_row = 0
         storage.finish_plan_job(city.slug, stage, "done" if finished else "pending")
+        if not finished:
+            # остались задачи (у других воркеров или на повтор) — 10 мин берём другие этапы, без холостых кругов
+            skip_until[f"{city.slug}/{stage}"] = time.monotonic() + 600
         logger.info("Этап %s/%s: %s", city.slug, stage, "выполнен" if finished else "остались задачи — продолжится")
         print_completeness(storage, city)
         if once:
             return
+
+
+def run_check(args: argparse.Namespace, storage: SyncStorage, proxies: List[str]) -> bool:
+    """Проверка всего, что нужно для обхода. True — всё в порядке."""
+    from fetcher import Blocked, HttpFetcher
+    from parser import REVIEWS_API, SITE, extract_initial_state, reviews_api_key
+
+    ok = True
+
+    def report(passed: bool, what: str, hint: str = "") -> None:
+        nonlocal ok
+        ok &= passed
+        logger.info("  %s %s%s", "OK  " if passed else "FAIL", what, "" if passed or not hint else f"  ->  {hint}")
+
+    logger.info("Проверка окружения")
+    py = sys.version_info
+    report(py < (3, 14), f"Python {py.major}.{py.minor}",
+           "на 3.14 у Playwright утечка памяти — для долгих прогонов Python 3.12 (Docker-образ)")
+
+    try:
+        storage.init_db()
+        row = storage._conn.execute(
+            "SELECT current_database() AS db, current_user AS usr, split_part(version(), ' ', 2) AS ver").fetchone()
+        report(True, f"PostgreSQL {row['ver']}: база {row['db']}, пользователь {row['usr']}, схема {args.schema} создана")
+    except Exception as e:
+        report(False, f"PostgreSQL: {str(e).splitlines()[0][:150]}",
+               "проверьте PG_DSN в .env, доступ с этого компьютера (pg_hba.conf, файрвол) и право CREATE на базу")
+        return False
+
+    html = None
+    for proxy in proxies or [None]:
+        name = f"прокси {proxy.split('@')[-1]}" if proxy else "свой IP"
+        http = HttpFetcher([proxy] if proxy else [], 1.0, 1)
+        try:
+            t0 = time.monotonic()
+            page_html, _ = http.get_html(f"{SITE}/astana")
+            state = extract_initial_state(page_html or "")
+            report(state is not None, f"2gis.kz по HTTP ({name}): {time.monotonic() - t0:.1f} с",
+                   "страница без данных — откройте в браузере 2gis.kz, нет ли заглушки или блокировки сети")
+            html = html or page_html
+        except Blocked:
+            report(False, f"2gis.kz по HTTP ({name}): капча / 403",
+                   "этот IP 2ГИС уже ограничивает — нужен другой IP или прокси")
+        except Exception as e:
+            report(False, f"2gis.kz по HTTP ({name}): {e}", "нет доступа в интернет или прокси не работает")
+        finally:
+            http.close()
+
+    key = reviews_api_key(html)
+    if key:
+        http = HttpFetcher(proxies[:1], 1.0, 1)
+        data = http.get_json(f"{REVIEWS_API}/3.0/branches/70000001018078991/reviews?limit=1&key={key}&locale=ru_KZ")
+        http.close()
+        report(bool(data and "reviews" in data), "API отзывов 2ГИС", "лента отзывов недоступна — отзывы пойдут медленнее, через браузер")
+    else:
+        report(False, "API отзывов 2ГИС: ключ сайта не найден на странице", "2ГИС поменял страницу — нужна правка парсера")
+
+    try:
+        with DgisBrowserScraper(args.headless, args.channel, proxies[:1], captcha_wait=0) as scraper:
+            t0 = time.monotonic()
+            page_html = scraper.load_page(scraper.browser_page(), f"{SITE}/astana")
+            report(bool(page_html and extract_initial_state(page_html)),
+                   f"Chrome: страница 2ГИС загружена за {time.monotonic() - t0:.1f} с",
+                   "страница не загрузилась — проверьте доступ в интернет из контейнера")
+    except CaptchaBlockedError:
+        report(False, "Chrome: 2ГИС показал капчу", "этот IP 2ГИС уже ограничивает — нужен другой IP или прокси")
+    except Exception as e:
+        report(False, f"Chrome не запустился: {str(e).splitlines()[0][:150]}",
+               "в Docker пересоберите образ (docker compose build); локально нужен установленный Google Chrome")
+
+    storage.init_plan(kz_plan_jobs())
+    plan = storage.plan_status()
+    done, total = sum(1 for r in plan if r["status"] == "done"), len(plan)
+    logger.info("  план kz: выполнено этапов %d из %d; прокси: %d", done, total, len(proxies))
+    logger.info("Итог: %s", "всё в порядке, можно запускать" if ok else "есть проблемы — см. FAIL выше")
+    return ok
 
 
 def main() -> None:
@@ -306,6 +394,7 @@ def main() -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)  # не писать в лог каждый из миллионов запросов
 
     if sys.version_info >= (3, 14) and args.command not in ("init-db", "stats", "plan"):
         # проверено: на 3.14 синхронный Playwright держит завершённые задачи вместе с результатами
@@ -316,6 +405,8 @@ def main() -> None:
     storage = SyncStorage(dsn=args.dsn, schema=args.schema)
     if not storage.is_configured:
         raise SystemExit("Не задан PG_DSN (в .env или --dsn).")
+    if args.command == "check":  # ошибки БД — понятным пунктом проверки, а не трассировкой
+        sys.exit(0 if run_check(args, storage, load_proxies(args.proxies, args.proxy)) else 1)
     storage.init_db()
 
     if args.command == "init-db":
@@ -332,9 +423,12 @@ def main() -> None:
         print_completeness(storage, None)
         return
 
+    proxies = load_proxies(args.proxies, args.proxy)
+    if getattr(args, "require_proxy", False) and not proxies:
+        raise SystemExit("Прокси не задан (--proxy / DGIS_PROXY_N в .env): этот воркер без прокси не запускается.")
     cities = [] if args.command == "kz" else resolve_cities(args.region, args.cities)
     subtypes = tuple(t.strip() for t in getattr(args, "subtypes", "").split(",") if t.strip())
-    with DgisBrowserScraper(args.headless, args.channel, load_proxies(args.proxies, args.proxy),
+    with DgisBrowserScraper(args.headless, args.channel, proxies,
                             map_mode=args.command == "area", pace_factor=args.pace,
                             captcha_wait=args.captcha_wait, concurrency=args.concurrency) as scraper:
         crawler = DgisCrawler(scraper, storage)

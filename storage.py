@@ -239,22 +239,40 @@ class SyncStorage:
     def objects_for_details(self, region_id: int, main_city: Optional[str], limit: Optional[int],
                             need: str = "details", shard: Tuple[int, int] = (0, 1)) -> List[Dict[str, Any]]:
         """
-        Объекты проекта (город + населённые пункты-спутники), которым не хватает карточки или отзывов.
-        Сначала сам город, потом спутники; внутри — объекты с большим числом отзывов первыми.
-        shard=(i, n) — доля i из n для параллельных процессов.
+        Берёт в работу объекты проекта (город + населённые пункты-спутники), которым не хватает
+        карточки или отзывов: сначала сам город, потом спутники; внутри — с большим числом отзывов
+        первыми. Взятые объекты арендуются на DETAILS_LEASE (details_lease_until), чужие аренды
+        пропускаются — так один город одновременно собирают несколько воркеров на разных IP.
+        После обработки аренду снимает release_details_lease. shard=(i, n) — доля i из n.
         """
         if not self.connect():
             return []
-        cur = self._conn.execute(
+        rows = self._conn.execute(
             f"""
-            SELECT {self._DETAIL_COLUMNS} FROM branches
-            WHERE region_id = %(region)s AND {self._NEEDS[need]} AND id %% %(n)s = %(i)s
-            ORDER BY (city IS DISTINCT FROM %(city)s), coalesce(review_count, 0) DESC, id
-            LIMIT %(limit)s
+            WITH picked AS (
+                SELECT id FROM branches
+                WHERE region_id = %(region)s AND {self._NEEDS[need]} AND id %% %(n)s = %(i)s
+                  AND (details_lease_until IS NULL OR details_lease_until < now())
+                ORDER BY (city IS DISTINCT FROM %(city)s), coalesce(review_count, 0) DESC, id
+                LIMIT %(limit)s
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE branches b SET details_lease_until = now() + %(lease)s::interval
+            FROM picked WHERE b.id = picked.id
+            RETURNING b.id, coalesce(b.raw->>'type', 'branch') AS type, b.name, b.review_count,
+                      b.card_synced_at, b.reviews_synced_at, (b.city IS DISTINCT FROM %(city)s) AS satellite
             """,
-            {"region": region_id, "city": main_city, "limit": limit, "n": shard[1], "i": shard[0]},
-        )
-        return list(cur.fetchall())
+            {"region": region_id, "city": main_city, "limit": limit, "n": shard[1], "i": shard[0],
+             "lease": self.DETAILS_LEASE},
+        ).fetchall()
+        return sorted(rows, key=lambda r: (r["satellite"], -(r["review_count"] or 0), r["id"]))
+
+    DETAILS_LEASE = "2 hours"
+
+    def release_details_lease(self, ids: Sequence[int]) -> None:
+        """Снимает аренду: собранные объекты уходят из выборки сами, неудачные снова доступны всем."""
+        if self.connect() and ids:
+            self._conn.execute("UPDATE branches SET details_lease_until = NULL WHERE id = ANY(%s)", (list(ids),))
 
     def count_objects_for_details(self, region_id: int, need: str = "details") -> int:
         if not self.connect():
@@ -854,13 +872,20 @@ class SyncStorage:
                 rows,
             )
 
+    SHARED_STAGES = ("catalog", "buildings", "details")
+
     def claim_plan_job(self, tiers: Sequence[int], worker: str, stale_minutes: int = 45,
-                       stages: Optional[Sequence[str]] = None) -> Optional[Dict[str, Any]]:
+                       stages: Optional[Sequence[str]] = None,
+                       exclude: Sequence[str] = ()) -> Optional[Dict[str, Any]]:
         """
         Следующий этап по порядку плана. Этап города берётся, только когда все предыдущие этапы
         этого города выполнены; этапы, «зависшие» у упавшего воркера, возвращаются в работу.
         Несколько воркеров (с разными IP) берут разные этапы — FOR UPDATE SKIP LOCKED.
+        К уже идущему общему этапу (SHARED_STAGES: каталог, здания, карточки) можно присоединиться —
+        их задачи раздаются по одной без повторов, так большой город собирают все воркеры сразу;
+        по порядку плана он идёт раньше этапов следующих городов.
         stages — только эти этапы (браузерный воркер и HTTP-воркер работают конвейером).
+        exclude — «город/этап», которые этот воркер пока пропускает (там нечего делать, задачи у других).
         """
         if not self.connect():
             return None
@@ -878,9 +903,11 @@ class SyncStorage:
                     started_at = coalesce(started_at, now()), updated_at = now()
                 WHERE (city_slug, stage) = (
                     SELECT p.city_slug, p.stage FROM crawl_plan p
-                    WHERE p.status = 'pending' AND p.tier = ANY(%(tiers)s)
+                    WHERE (p.status = 'pending' OR (p.status = 'running' AND p.stage = ANY(%(shared)s)))
+                      AND p.tier = ANY(%(tiers)s)
                       AND (%(stages)s::text[] IS NULL OR p.stage = ANY(%(stages)s::text[]))
                       AND (p.not_before IS NULL OR p.not_before <= now())
+                      AND (p.city_slug || '/' || p.stage) <> ALL(%(exclude)s::text[])
                       AND NOT EXISTS (
                           SELECT 1 FROM crawl_plan q
                           WHERE q.city_slug = p.city_slug AND q.position < p.position AND q.status <> 'done')
@@ -889,7 +916,8 @@ class SyncStorage:
                 )
                 RETURNING city_slug, stage, tier, attempts
                 """,
-                {"tiers": list(tiers), "worker": worker, "stages": list(stages) if stages else None},
+                {"tiers": list(tiers), "worker": worker, "stages": list(stages) if stages else None,
+                 "shared": list(self.SHARED_STAGES), "exclude": list(exclude)},
             ).fetchone()
 
     def finish_plan_job(self, city_slug: str, stage: str, status: str, error: Optional[str] = None,
