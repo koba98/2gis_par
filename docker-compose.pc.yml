@@ -1,0 +1,11 @@
+# Дополнение для Windows/macOS (Docker Desktop): там network_mode: host не даёт контейнеру
+# сеть хоста, как на Linux. Обычная сеть Docker выходит в интернет и к серверу БД через NAT.
+#   docker compose -f docker-compose.yml -f docker-compose.pc.yml up -d kz kz-http
+# Если PostgreSQL стоит на этом же компьютере — в PG_DSN вместо localhost пишите host.docker.internal.
+services:
+  parser:
+    network_mode: bridge
+  kz:
+    network_mode: bridge
+  kz-http:
+    network_mode: bridge
